@@ -216,7 +216,7 @@ function emit(type, extra = {}) { window.dispatchEvent(new CustomEvent('gaze', {
 const DEFAULTS = {
   apiKey: '', model: 'claude-haiku-5-5', name: 'ミル',
   persona: '好奇心旺盛で、ちょっといたずら好き。相手のことを知りたがる。難しい話も身近なたとえで短く返す。語尾はやわらかく、たまに「ふむふむ」「おっ」などの相づちを入れる。',
-  voiceURI: '', rate: 1.05, pitch: 1.15,
+  voiceURI: '', rate: 1.0, pitch: 1.0,
   sendImage: true, greet: true, continuous: false,
   follow: 'gaze', invX: false, invY: false, gain: 2.2, upBias: 0.12, blinkSync: true,
   eyeColor: 'aqua', debug: false,
@@ -226,6 +226,7 @@ if (store.get('cfg', null) === null && store.get('gain', null) !== null) {   // 
   cfg.gain = +store.get('gain', cfg.gain); cfg.upBias = +store.get('upBias', cfg.upBias);
   cfg.follow = store.get('follow', cfg.follow); cfg.invX = !!store.get('invX', false); cfg.invY = !!store.get('invY', false); cfg.debug = !!store.get('debug', false);
 }
+if (cfg.pitch === 1.15 && cfg.rate === 1.05) { cfg.pitch = 1.0; cfg.rate = 1.0; }   // 旧版の初期値は声が不自然だったので戻す
 const saveCfg = () => store.set('cfg', cfg);
 
 /* ========= DOM ========= */
@@ -567,18 +568,24 @@ function caption(text, kind = 'say', ms = 7000) {
 
 /* ========= 音声合成 ========= */
 let voices = [];
+// 同じ名前でも compact（標準）/ enhanced（拡張）/ premium（プレミアム）の別エントリがある。品質の高いものを優先
+const voiceQuality = v => /premium/i.test(v.voiceURI + v.name) ? 3 : /enhanced|拡張/i.test(v.voiceURI + v.name) ? 2 : /siri/i.test(v.voiceURI + v.name) ? 2 : /compact/i.test(v.voiceURI) ? 0 : 1;
+const qualityLabel = v => ['標準', '', '拡張', 'プレミアム'][voiceQuality(v)];
 function loadVoices() {
   voices = speechSynthesis.getVoices();
   const sel = $('#voiceURI'); const cur = cfg.voiceURI;
-  sel.innerHTML = '<option value="">自動（日本語）</option>';
-  for (const v of voices) if (/^ja/i.test(v.lang)) { const o = document.createElement('option'); o.value = v.voiceURI; o.textContent = `${v.name}`; sel.appendChild(o); }
+  sel.innerHTML = '<option value="">自動（いちばん品質の高い日本語音声）</option>';
+  const ja = voices.filter(v => /^ja/i.test(v.lang)).sort((a, b) => voiceQuality(b) - voiceQuality(a));
+  for (const v of ja) { const o = document.createElement('option'); o.value = v.voiceURI; const q = qualityLabel(v); o.textContent = q ? `${v.name}（${q}）` : v.name; sel.appendChild(o); }
   sel.value = voices.some(v => v.voiceURI === cur) ? cur : '';
 }
 if ('speechSynthesis' in window) { loadVoices(); speechSynthesis.onvoiceschanged = loadVoices; }
 function pickVoice() {
   if (cfg.voiceURI) { const v = voices.find(v => v.voiceURI === cfg.voiceURI); if (v) return v; }
   const ja = voices.filter(v => /^ja/i.test(v.lang));
-  return ja.find(v => /Kyoko|O-ren|Otoya|Hattori/i.test(v.name)) || ja.find(v => /Siri|Premium|Enhanced/i.test(v.name)) || ja[0] || null;
+  if (!ja.length) return null;
+  const pref = v => /Kyoko|O-ren|Hattori|Otoya/i.test(v.name) ? 1 : 0;
+  return ja.sort((a, b) => (voiceQuality(b) - voiceQuality(a)) || (pref(b) - pref(a)))[0];
 }
 let currentUtter = null;
 function speak(text) {
