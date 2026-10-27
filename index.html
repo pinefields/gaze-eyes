@@ -157,7 +157,8 @@
     <label class="field"><span>見たものを伝える<small>話しかけるたびにカメラ画像を1枚 Claude に送ります</small></span><span class="switch"><input type="checkbox" id="sendImage" data-cfg="sendImage"><i></i></span></label>
     <label class="field"><span>目が合ったら話しかける<small>しばらく会話がないときだけ</small></span><span class="switch"><input type="checkbox" id="greet" data-cfg="greet"><i></i></span></label>
     <label class="field"><span>返事のあと続けて聞く</span><span class="switch"><input type="checkbox" id="continuous" data-cfg="continuous"><i></i></span></label>
-    <label class="field"><span>声</span><select id="voiceURI" data-cfg="voiceURI"><option value="">自動（日本語）</option></select></label>
+    <label class="field"><span>声<small>同じ名前が複数あるのは標準版と拡張版などです。試聴で聞き比べてください</small></span><select id="voiceKey" data-cfg="voiceKey"><option value="">自動（日本語）</option></select></label>
+    <div class="btnrow"><button id="btnPreview">この声で試聴</button></div>
     <label class="field"><span>話す速さ</span><input type="range" id="rate" data-cfg="rate" min="0.7" max="1.5" step="0.05"></label>
     <label class="field"><span>声の高さ</span><input type="range" id="pitch" data-cfg="pitch" min="0.6" max="1.8" step="0.05"></label>
 
@@ -216,7 +217,7 @@ function emit(type, extra = {}) { window.dispatchEvent(new CustomEvent('gaze', {
 const DEFAULTS = {
   apiKey: '', model: 'claude-haiku-5-5', name: 'ミル',
   persona: '好奇心旺盛で、ちょっといたずら好き。相手のことを知りたがる。難しい話も身近なたとえで短く返す。語尾はやわらかく、たまに「ふむふむ」「おっ」などの相づちを入れる。',
-  voiceURI: '', rate: 1.0, pitch: 1.0,
+  voiceKey: '', rate: 1.0, pitch: 1.0,
   sendImage: true, greet: true, continuous: false,
   follow: 'gaze', invX: false, invY: false, gain: 2.2, upBias: 0.12, blinkSync: true,
   eyeColor: 'aqua', debug: false,
@@ -567,25 +568,34 @@ function caption(text, kind = 'say', ms = 7000) {
 }
 
 /* ========= 音声合成 ========= */
-let voices = [];
-// 同じ名前でも compact（標準）/ enhanced（拡張）/ premium（プレミアム）の別エントリがある。品質の高いものを優先
-const voiceQuality = v => /premium/i.test(v.voiceURI + v.name) ? 3 : /enhanced|拡張/i.test(v.voiceURI + v.name) ? 2 : /siri/i.test(v.voiceURI + v.name) ? 2 : /compact/i.test(v.voiceURI) ? 0 : 1;
-const qualityLabel = v => ['標準', '', '拡張', 'プレミアム'][voiceQuality(v)];
+let jaVoices = [];   // [{v, key, label}] 日本語の音声一覧
+// Safari は同じ名前（例: Kyoko の標準版と拡張版）を区別できる情報をくれないことが多いので、
+// 「名前#通し番号」を鍵にし、品質が URI から分かるときだけ表示に添える
+const voiceQuality = v => /premium/i.test(v.voiceURI) ? 3 : /enhanced/i.test(v.voiceURI) ? 2 : /compact/i.test(v.voiceURI) ? 0 : 1;
 function loadVoices() {
-  voices = speechSynthesis.getVoices();
-  const sel = $('#voiceURI'); const cur = cfg.voiceURI;
-  sel.innerHTML = '<option value="">自動（いちばん品質の高い日本語音声）</option>';
-  const ja = voices.filter(v => /^ja/i.test(v.lang)).sort((a, b) => voiceQuality(b) - voiceQuality(a));
-  for (const v of ja) { const o = document.createElement('option'); o.value = v.voiceURI; const q = qualityLabel(v); o.textContent = q ? `${v.name}（${q}）` : v.name; sel.appendChild(o); }
-  sel.value = voices.some(v => v.voiceURI === cur) ? cur : '';
+  const all = speechSynthesis.getVoices();
+  const count = {};
+  jaVoices = all.filter(v => /^ja/i.test(v.lang)).map(v => {
+    const n = count[v.name] = (count[v.name] || 0) + 1;
+    return { v, key: `${v.name}#${n}`, n };
+  });
+  for (const e of jaVoices) {
+    const q = ['標準', '', '拡張', 'プレミアム'][voiceQuality(e.v)];
+    const dup = count[e.v.name] > 1;
+    e.label = e.v.name + (q ? `（${q}）` : dup ? `（${e.n}）` : '') + (e.v.default ? ' ★既定' : '');
+  }
+  const sel = $('#voiceKey');
+  sel.innerHTML = '<option value="">自動（日本語）</option>';
+  for (const e of jaVoices) { const o = document.createElement('option'); o.value = e.key; o.textContent = e.label; sel.appendChild(o); }
+  sel.value = jaVoices.some(e => e.key === cfg.voiceKey) ? cfg.voiceKey : '';
 }
 if ('speechSynthesis' in window) { loadVoices(); speechSynthesis.onvoiceschanged = loadVoices; }
 function pickVoice() {
-  if (cfg.voiceURI) { const v = voices.find(v => v.voiceURI === cfg.voiceURI); if (v) return v; }
-  const ja = voices.filter(v => /^ja/i.test(v.lang));
-  if (!ja.length) return null;
+  if (!jaVoices.length) loadVoices();
+  if (cfg.voiceKey) { const e = jaVoices.find(e => e.key === cfg.voiceKey); if (e) return e.v; }
+  if (!jaVoices.length) return null;
   const pref = v => /Kyoko|O-ren|Hattori|Otoya/i.test(v.name) ? 1 : 0;
-  return ja.sort((a, b) => (voiceQuality(b) - voiceQuality(a)) || (pref(b) - pref(a)))[0];
+  return [...jaVoices].sort((a, b) => (voiceQuality(b.v) - voiceQuality(a.v)) || (pref(b.v) - pref(a.v)))[0].v;
 }
 let currentUtter = null;
 function speak(text) {
@@ -789,6 +799,13 @@ $('#btnSettings').addEventListener('click', openSheet);
 $('#btnClose').addEventListener('click', () => { sheet.hidden = true; });
 sheet.addEventListener('click', e => { if (e.target === sheet) sheet.hidden = true; });
 $('#btnClearHist').addEventListener('click', () => { history = []; $('#testResult').textContent = '会話履歴を消しました'; $('#testResult').className = ''; });
+$('#btnPreview').addEventListener('click', async () => {
+  const v = pickVoice();
+  const samples = [`こんにちは、${cfg.name}です。今日はいい天気ですね。`, `おっ、来てくれたんだ。何して遊ぶ？`, `ふむふむ、それは面白いね。もっと聞かせて。`];
+  caption(`試聴: ${v ? v.name : '（日本語の声が見つかりません）'}`, 'heard', 4000);
+  setExpr('happy', 4000);
+  await speak(samples[Math.floor(Math.random() * samples.length)]);
+});
 $('#btnTest').addEventListener('click', async () => {
   const out = $('#testResult'); out.className = ''; out.textContent = '接続中…';
   try {
