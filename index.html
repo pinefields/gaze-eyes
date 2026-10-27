@@ -9,67 +9,104 @@
 <title>Gaze Eyes</title>
 <style>
   /*
-   * Gaze Eyes — iPhone Safari 向け「目が人を追う」試作
-   *   ① 顔追従: 前面カメラの顔位置へ瞳を向ける（アイコンタクト）
-   *   ② 視線推定: 相手がこちらを見ているかを判定し、表情を変える
-   * 認識は MediaPipe Face Landmarker（端末内 WASM/WebGL）。映像は外に出ません。
+   * Gaze Eyes — iPhone Safari 向け「目が人を追い、Claude と話す」試作
+   *   ・前面カメラで顔と視線を追う（MediaPipe Face Landmarker、端末内処理）
+   *   ・2つの目だけで感情を表す（形の伸び縮み・まぶた・瞬き）
+   *   ・音声認識 → Claude API → 音声合成。Claude の返事に含まれる感情で表情が変わる
    */
   :root {
-    --bg: #0b0f1a;          /* 深い紺。純黒より目が浮きすぎない */
+    --bg: #0b0f1a;
     --bg-soft: #141a2b;
-    --sclera: #eef2fb;
-    --iris: #3fc8bd;        /* 通常の虹彩 */
-    --iris-hot: #8af5e8;    /* 目が合ったとき */
-    --pupil: #0a0d16;
+    --panel: #10162a;
+    --line: rgba(215,220,234,.14);
     --fg: #d7dcea;
     --muted: #7d86a3;
+    --accent: #3fc8bd;
+    --accent-hot: #8af5e8;
     --ok: #62d49a;
     --warn: #f0b35c;
+    --err: #f07a7a;
     --font: -apple-system, "Hiragino Sans", "Hiragino Kaku Gothic ProN", "Noto Sans JP", system-ui, sans-serif;
     --mono: "SF Mono", Menlo, Consolas, monospace;
     color-scheme: dark;
   }
   html, body { height: 100%; margin: 0; background: var(--bg); color: var(--fg); font-family: var(--font); overflow: hidden; -webkit-user-select: none; user-select: none; -webkit-tap-highlight-color: transparent; }
+  input, textarea, select { -webkit-user-select: text; user-select: text; }
   #face { position: fixed; inset: 0; display: block; touch-action: none; }
   #cam { position: fixed; left: 0; top: 0; width: 2px; height: 2px; opacity: 0.01; pointer-events: none; }
+  [hidden] { display: none !important; }
 
   /* 上部ステータス */
-  #hud { position: fixed; top: max(10px, env(safe-area-inset-top)); left: 0; right: 0; display: flex; justify-content: center; pointer-events: none; }
+  #hud { position: fixed; top: max(10px, env(safe-area-inset-top)); left: 0; right: 0; display: flex; justify-content: center; pointer-events: none; z-index: 2; }
   #status { display: inline-flex; align-items: center; gap: 8px; padding: 6px 12px; border-radius: 999px; background: rgba(20,26,43,.78); backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); font-size: 13px; letter-spacing: .02em; }
   #status .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); transition: background .25s; }
-  #status.track .dot { background: var(--iris); }
+  #status.track .dot { background: var(--accent); }
   #status.contact .dot { background: var(--ok); box-shadow: 0 0 10px var(--ok); }
   #status.warn .dot { background: var(--warn); }
   #status .fps { font-family: var(--mono); font-size: 11px; color: var(--muted); }
 
+  /* 字幕 */
+  #caption { position: fixed; left: 50%; bottom: calc(max(12px, env(safe-area-inset-bottom)) + 96px); transform: translateX(-50%); max-width: min(34em, calc(100vw - 32px)); padding: 10px 16px; border-radius: 16px; background: rgba(20,26,43,.88); backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); font-size: 15px; line-height: 1.6; text-align: center; transition: opacity .4s; pointer-events: none; z-index: 2; }
+  #caption.hide { opacity: 0; }
+  #caption.heard { color: var(--muted); }
+  #caption.say { color: var(--fg); border: 1px solid rgba(63,200,189,.35); }
+  #caption.err { color: var(--warn); }
+
   /* 下部コントロール */
-  #controls { position: fixed; left: 0; right: 0; bottom: 0; padding: 10px max(14px, env(safe-area-inset-right)) max(12px, env(safe-area-inset-bottom)) max(14px, env(safe-area-inset-left)); display: flex; flex-direction: column; gap: 8px; background: linear-gradient(to top, rgba(11,15,26,.95), rgba(11,15,26,0)); }
-  .row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-  .row label { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); flex: 1 1 140px; min-width: 0; }
-  .row label span { white-space: nowrap; }
-  .row input[type=range] { flex: 1; min-width: 0; accent-color: var(--iris); }
-  button { font: inherit; font-size: 13px; padding: 8px 14px; border-radius: 10px; border: 1px solid rgba(215,220,234,.18); background: rgba(20,26,43,.85); color: var(--fg); }
+  #controls { position: fixed; left: 0; right: 0; bottom: 0; padding: 8px max(14px, env(safe-area-inset-right)) max(12px, env(safe-area-inset-bottom)) max(14px, env(safe-area-inset-left)); display: flex; flex-direction: column; gap: 10px; background: linear-gradient(to top, rgba(11,15,26,.95), rgba(11,15,26,0)); z-index: 2; }
+  .bar { display: flex; align-items: center; justify-content: center; gap: 18px; }
+  button { font: inherit; font-size: 13px; padding: 8px 14px; border-radius: 12px; border: 1px solid var(--line); background: rgba(20,26,43,.85); color: var(--fg); }
   button:active { background: rgba(63,200,189,.25); }
-  button.on { border-color: var(--iris); color: var(--iris-hot); }
-  button:focus-visible { outline: 2px solid var(--iris-hot); outline-offset: 2px; }
+  button.on { border-color: var(--accent); color: var(--accent-hot); }
+  button:focus-visible { outline: 2px solid var(--accent-hot); outline-offset: 2px; }
+  button.round { width: 56px; height: 56px; border-radius: 50%; padding: 0; font-size: 12px; }
+  #btnTalk { width: 84px; height: 84px; border-radius: 50%; padding: 0; font-size: 16px; font-weight: 600; background: var(--accent); color: #06201e; border: none; box-shadow: 0 6px 24px rgba(63,200,189,.35); position: relative; }
+  #btnTalk:active { background: var(--accent-hot); }
+  #btnTalk.listening { background: var(--err); color: #fff; box-shadow: 0 0 0 0 rgba(240,122,122,.6); animation: pulse 1.2s infinite; }
+  #btnTalk.busy { background: var(--bg-soft); color: var(--muted); box-shadow: none; }
+  @keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(240,122,122,.55); } 100% { box-shadow: 0 0 0 22px rgba(240,122,122,0); } }
+  #textRow { display: flex; gap: 8px; }
+  #textRow input { flex: 1; min-width: 0; font: inherit; font-size: 16px; padding: 10px 14px; border-radius: 12px; border: 1px solid var(--line); background: var(--panel); color: var(--fg); }
+
+  /* 設定シート */
+  #sheet { position: fixed; inset: 0; z-index: 10; background: rgba(5,8,16,.55); display: flex; align-items: flex-end; justify-content: center; }
+  #sheet .panel { width: min(560px, 100%); max-height: 88%; overflow-y: auto; -webkit-overflow-scrolling: touch; background: var(--panel); border-radius: 20px 20px 0 0; padding: 14px max(18px, env(safe-area-inset-right)) max(24px, env(safe-area-inset-bottom)) max(18px, env(safe-area-inset-left)); box-shadow: 0 -8px 40px rgba(0,0,0,.5); }
+  #sheet h2 { font-size: 16px; margin: 4px 0 12px; display: flex; justify-content: space-between; align-items: center; }
+  #sheet h3 { font-size: 12px; letter-spacing: .08em; color: var(--muted); margin: 18px 0 8px; text-transform: uppercase; }
+  .field { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 9px 0; border-bottom: 1px solid var(--line); font-size: 14px; }
+  .field > span:first-child { flex: 1 1 auto; min-width: 0; }
+  .field input, .field select, .field textarea { box-sizing: border-box; }
+  .field small { display: block; color: var(--muted); font-size: 11px; margin-top: 2px; }
+  .field input[type=text], .field input[type=password], .field select, .field textarea { font: inherit; font-size: 14px; padding: 7px 10px; border-radius: 9px; border: 1px solid var(--line); background: var(--bg-soft); color: var(--fg); width: 56%; min-width: 0; }
+  .field textarea { width: 100%; height: 4.5em; resize: vertical; }
+  .field.col { flex-direction: column; align-items: stretch; }
+  .field input[type=range] { width: 50%; accent-color: var(--accent); }
+  .switch { position: relative; width: 46px; height: 28px; flex: none; }
+  .switch input { opacity: 0; width: 0; height: 0; position: absolute; }
+  .switch i { position: absolute; inset: 0; border-radius: 999px; background: #2a3350; transition: .2s; }
+  .switch i::after { content: ""; position: absolute; left: 3px; top: 3px; width: 22px; height: 22px; border-radius: 50%; background: #fff; transition: .2s; }
+  .switch input:checked + i { background: var(--accent); }
+  .switch input:checked + i::after { transform: translateX(18px); }
+  .switch input:focus-visible + i { outline: 2px solid var(--accent-hot); }
+  .btnrow { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+  #testResult { font-size: 12px; color: var(--muted); margin-top: 6px; min-height: 1.3em; }
+  #testResult.ok { color: var(--ok); } #testResult.ng { color: var(--err); }
 
   /* デバッグ表示 */
-  #debug { position: fixed; left: max(10px, env(safe-area-inset-left)); top: calc(max(10px, env(safe-area-inset-top)) + 40px); display: flex; gap: 10px; align-items: flex-start; pointer-events: none; }
-  #thumb { width: 108px; height: 144px; border-radius: 10px; background: var(--bg-soft); border: 1px solid rgba(215,220,234,.15); }
-  #vals { margin: 0; font-family: var(--mono); font-size: 11px; line-height: 1.45; color: var(--fg); background: rgba(20,26,43,.78); padding: 8px 10px; border-radius: 10px; min-width: 150px; }
-  #vals b { color: var(--muted); font-weight: 500; display: inline-block; width: 4.5em; }
-  #log { margin: 0; font-family: var(--mono); font-size: 11px; line-height: 1.45; color: var(--muted); background: rgba(20,26,43,.78); padding: 8px 10px; border-radius: 10px; }
-  #log .ev { color: var(--fg); }
+  #debug { position: fixed; left: max(10px, env(safe-area-inset-left)); top: calc(max(10px, env(safe-area-inset-top)) + 40px); display: flex; gap: 10px; align-items: flex-start; pointer-events: none; z-index: 2; }
+  #thumb { width: 96px; height: 128px; border-radius: 10px; background: var(--bg-soft); border: 1px solid var(--line); }
+  #vals, #log { margin: 0; font-family: var(--mono); font-size: 11px; line-height: 1.45; background: rgba(20,26,43,.78); padding: 8px 10px; border-radius: 10px; }
+  #vals { color: var(--fg); min-width: 150px; } #vals b { color: var(--muted); font-weight: 500; display: inline-block; width: 4.5em; }
+  #log { color: var(--muted); } #log .ev { color: var(--fg); }
 
   /* 開始オーバーレイ */
-  #start { position: fixed; inset: 0; display: flex; flex-direction: column; justify-content: center; align-items: center; gap: 18px; padding: 24px; text-align: center; background: rgba(11,15,26,.92); backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px); z-index: 5; }
+  #start { position: fixed; inset: 0; display: flex; flex-direction: column; justify-content: center; align-items: center; gap: 18px; padding: 24px; text-align: center; background: rgba(11,15,26,.92); backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px); z-index: 20; }
   #start h1 { font-size: 22px; font-weight: 600; margin: 0; letter-spacing: .04em; }
   #start p { margin: 0; max-width: 32em; color: var(--muted); font-size: 14px; line-height: 1.7; text-wrap: balance; }
   #start .btns { display: flex; gap: 12px; flex-wrap: wrap; justify-content: center; }
-  #start button.primary { background: var(--iris); color: #06201e; border-color: transparent; font-weight: 600; padding: 12px 22px; font-size: 15px; }
+  #start button.primary { background: var(--accent); color: #06201e; border-color: transparent; font-weight: 600; padding: 12px 22px; font-size: 15px; }
   #start #msg { font-size: 13px; color: var(--warn); min-height: 1.4em; max-width: 34em; }
-  [hidden] { display: none !important; }
-  @media (prefers-reduced-motion: reduce) { #status .dot { transition: none; } }
+  @media (prefers-reduced-motion: reduce) { #btnTalk.listening { animation: none; } }
 </style>
 </head>
 <body>
@@ -80,28 +117,65 @@
 <div id="hud"><div id="status"><span class="dot"></span><span id="stText">待機中</span><span class="fps" id="fps"></span></div></div>
 
 <div id="debug" hidden>
-  <canvas id="thumb" width="216" height="288"></canvas>
+  <canvas id="thumb" width="192" height="256"></canvas>
   <div style="display:flex;flex-direction:column;gap:8px">
     <pre id="vals">—</pre>
     <pre id="log"></pre>
   </div>
 </div>
 
+<div id="caption" class="hide"></div>
+
 <div id="controls">
-  <div class="row">
-    <label><span>感度</span><input type="range" id="gain" min="0.8" max="4" step="0.1" value="2.2"></label>
-    <label><span>上目補正</span><input type="range" id="upBias" min="0" max="0.5" step="0.01" value="0.12"></label>
+  <div id="textRow" hidden>
+    <input id="txt" type="text" placeholder="文字で話しかける" autocomplete="off" enterkeyhint="send">
+    <button id="btnSend">送信</button>
   </div>
-  <div class="row">
-    <button id="btnDebug">デバッグ表示</button>
-    <button id="btnBlinkSync" class="on">瞬き同期</button>
-    <button id="btnTouch">タッチ操作</button>
+  <div class="bar">
+    <button id="btnSettings" class="round">設定</button>
+    <button id="btnTalk"><span id="talkLabel">話す</span></button>
+    <button id="btnKbd" class="round">文字</button>
+  </div>
+</div>
+
+<div id="sheet" hidden>
+  <div class="panel">
+    <h2>設定 <button id="btnClose">閉じる</button></h2>
+
+    <h3>Claude 接続</h3>
+    <label class="field"><span>APIキー<small>この端末のブラウザ内にだけ保存されます</small></span><input type="password" id="apiKey" data-cfg="apiKey" placeholder="sk-ant-…" autocomplete="off"></label>
+    <label class="field"><span>モデル</span><input type="text" id="model" data-cfg="model" placeholder="claude-haiku-5-5"></label>
+    <div class="btnrow"><button id="btnTest">接続テスト</button><button id="btnClearHist">会話履歴を消す</button></div>
+    <div id="testResult"></div>
+
+    <h3>キャラクター</h3>
+    <label class="field"><span>名前</span><input type="text" id="name" data-cfg="name"></label>
+    <label class="field col"><span>性格・話し方</span><textarea id="persona" data-cfg="persona"></textarea></label>
+    <label class="field"><span>目の色</span><select id="eyeColor" data-cfg="eyeColor"><option value="aqua">アクア</option><option value="lime">ライム</option><option value="amber">アンバー</option><option value="lavender">ラベンダー</option><option value="snow">スノー</option></select></label>
+
+    <h3>会話</h3>
+    <label class="field"><span>見たものを伝える<small>話しかけるたびにカメラ画像を1枚 Claude に送ります</small></span><span class="switch"><input type="checkbox" id="sendImage" data-cfg="sendImage"><i></i></span></label>
+    <label class="field"><span>目が合ったら話しかける<small>しばらく会話がないときだけ</small></span><span class="switch"><input type="checkbox" id="greet" data-cfg="greet"><i></i></span></label>
+    <label class="field"><span>返事のあと続けて聞く</span><span class="switch"><input type="checkbox" id="continuous" data-cfg="continuous"><i></i></span></label>
+    <label class="field"><span>声</span><select id="voiceURI" data-cfg="voiceURI"><option value="">自動（日本語）</option></select></label>
+    <label class="field"><span>話す速さ</span><input type="range" id="rate" data-cfg="rate" min="0.7" max="1.5" step="0.05"></label>
+    <label class="field"><span>声の高さ</span><input type="range" id="pitch" data-cfg="pitch" min="0.6" max="1.8" step="0.05"></label>
+
+    <h3>目の追従</h3>
+    <label class="field"><span>モード</span><select id="follow" data-cfg="follow"><option value="gaze">視線を追う</option><option value="face">目を合わせる</option></select></label>
+    <label class="field"><span>感度</span><input type="range" id="gain" data-cfg="gain" min="0.8" max="4" step="0.1"></label>
+    <label class="field"><span>上目補正</span><input type="range" id="upBias" data-cfg="upBias" min="0" max="0.5" step="0.01"></label>
+    <label class="field"><span>瞬きを相手に合わせる</span><span class="switch"><input type="checkbox" id="blinkSync" data-cfg="blinkSync"><i></i></span></label>
+    <label class="field"><span>上下反転<small>カメラが逆向きの環境用</small></span><span class="switch"><input type="checkbox" id="invY" data-cfg="invY"><i></i></span></label>
+    <label class="field"><span>左右反転</span><span class="switch"><input type="checkbox" id="invX" data-cfg="invX"><i></i></span></label>
+    <label class="field"><span>デバッグ表示</span><span class="switch"><input type="checkbox" id="debugSw" data-cfg="debug"><i></i></span></label>
+    <p style="font-size:12px;color:var(--muted);line-height:1.6;margin:12px 0 0">画面をダブルタップすると表情を順に試せます。ドラッグで目を動かせます。</p>
   </div>
 </div>
 
 <div id="start">
   <h1>Gaze Eyes</h1>
-  <p>前面カメラで顔を見つけ、瞳がその人を追います。こちらを見ていると判定すると目が笑います。処理はすべて端末内で行い、映像は送信しません。</p>
+  <p>前面カメラで顔を見つけ、目がその人の視線を追います。「話す」を押すと Claude が返事をし、気持ちが目に出ます。顔の認識は端末内で行い、映像は「見たものを伝える」をオンにしたときだけ、話しかけた瞬間の1枚を Claude に送ります。</p>
   <div class="btns">
     <button class="primary" id="btnStart">カメラで開始</button>
     <button id="btnTouchOnly">カメラなしで試す</button>
@@ -110,184 +184,270 @@
 </div>
 
 <script type="module">
-/* ========= 設定 ========= */
+/* ========= 定数 ========= */
 const MP_VER  = '0.10.14';
 const MP_BASE = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MP_VER}`;
-const MODEL   = 'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task';
-const DETECT_FPS = 15;             // 認識は間引き（発熱・電池対策）。描画は60fps
-const CONTACT_ON_MS  = 300;        // 「見ている」が続いたら目が合ったと判定
-const CONTACT_OFF_MS = 600;        // 「見ていない」が続いたら解除
-const FACE_LOST_MS   = 1200;       // 顔を見失ってアイドルに入るまで
-const SLEEPY_MS      = 20000;      // 誰もいない時間が続くと眠そうに
-// 視線判定のしきい値（デバッグ表示の値を見ながら調整）
-const TH = { yaw: 18, pitch: 15, gazeX: 0.40, gazeY: 0.35 };
+const MODEL_URL = 'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task';
+const API_URL = 'https://api.anthropic.com/v1/messages';
+const DETECT_FPS = 15;
+const CONTACT_ON_MS = 300, CONTACT_OFF_MS = 600, FACE_LOST_MS = 1200, SLEEPY_MS = 25000;
+const FOV_DEG = 65;
+const TH = { yaw: 18, pitchUp: 12, pitchDown: 22, eyeX: 0.07, gazeY: 0.35 };
+const GREET_IDLE_MS = 90000, GREET_COOLDOWN_MS = 180000;
+const EMOTIONS = ['neutral', 'happy', 'excited', 'curious', 'surprised', 'sad', 'sleepy', 'thinking', 'annoyed'];
+const COLORS = { aqua: ['#3fc8bd', '#8af5e8'], lime: ['#9be15d', '#d7ff9f'], amber: ['#f5b14a', '#ffdf99'], lavender: ['#a98cff', '#d6c8ff'], snow: ['#dfe6f5', '#ffffff'] };
 
-/* ========= DOM ========= */
+/* ========= 小道具 ========= */
 const $ = s => document.querySelector(s);
-const face = $('#face'), ctx = face.getContext('2d');
-const cam = $('#cam');
-const thumb = $('#thumb'), tctx = thumb.getContext('2d');
-const stEl = $('#status'), stText = $('#stText'), fpsEl = $('#fps');
-const valsEl = $('#vals'), logEl = $('#log'), msgEl = $('#msg');
-const gainEl = $('#gain'), upBiasEl = $('#upBias');
-
-/* ========= 状態 ========= */
-const S = {
-  target: { x: 0, y: 0 },   // 瞳の目標位置 (-1..1)
-  pupil:  { x: 0, y: 0 },   // 現在の瞳位置
-  conv: 0, convT: 0,        // 寄り目（距離）
-  happy: 0, happyT: 0,      // 下まぶたの笑い
-  lidBase: 0,               // 眠さ（常時のまぶた）
-  blinkAt: -1, nextBlink: 0,
-  faceAt: -1e9,             // 最後に顔を見た時刻
-  looking: false, lookSince: 0, notLookSince: 0,
-  contact: false,
-  touchUntil: 0,            // タッチ操作が優先される期限
-  idleNext: 0,
-  mode: 'idle',
-  vals: null,
-  detCount: 0, detFps: 0, detFpsAt: 0,
-  blinkSync: true,
-};
-let landmarker = null, lastDetect = 0, lastT = 0, W = 0, H = 0, wakeLock = null;
-
-/* ========= ユーティリティ ========= */
 const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
-const lerp  = (a, b, t) => a + (b - a) * t;
-const ease  = t => t < .5 ? 2*t*t : 1 - Math.pow(-2*t + 2, 2) / 2;
-function setStatus(cls, text) { stEl.className = cls; stText.textContent = text; }
+const lerp = (a, b, t) => a + (b - a) * t;
+const store = {
+  get(k, d) { try { const v = localStorage.getItem('gaze.' + k); return v === null ? d : JSON.parse(v); } catch { return d; } },
+  set(k, v) { try { localStorage.setItem('gaze.' + k, JSON.stringify(v)); } catch {} },
+};
 function log(msg) {
   const t = new Date().toTimeString().slice(0, 8);
   const d = document.createElement('div'); d.className = 'ev'; d.textContent = `${t} ${msg}`;
   logEl.prepend(d); while (logEl.children.length > 4) logEl.lastChild.remove();
 }
-/* 会話アプリ側はこのイベントを拾って Claude へ渡す想定:
-   window.addEventListener('gaze', e => console.log(e.detail)) */
-function emit(type, extra = {}) {
-  window.dispatchEvent(new CustomEvent('gaze', { detail: { type, at: Date.now(), ...extra } }));
-}
-const store = {
-  get(k, d) { try { const v = localStorage.getItem('gaze.' + k); return v === null ? d : JSON.parse(v); } catch { return d; } },
-  set(k, v) { try { localStorage.setItem('gaze.' + k, JSON.stringify(v)); } catch {} },
+function emit(type, extra = {}) { window.dispatchEvent(new CustomEvent('gaze', { detail: { type, at: Date.now(), ...extra } })); }
+
+/* ========= 設定（端末内に保存） ========= */
+const DEFAULTS = {
+  apiKey: '', model: 'claude-haiku-5-5', name: 'ミル',
+  persona: '好奇心旺盛で、ちょっといたずら好き。相手のことを知りたがる。難しい話も身近なたとえで短く返す。語尾はやわらかく、たまに「ふむふむ」「おっ」などの相づちを入れる。',
+  voiceURI: '', rate: 1.05, pitch: 1.15,
+  sendImage: true, greet: true, continuous: false,
+  follow: 'gaze', invX: false, invY: false, gain: 2.2, upBias: 0.12, blinkSync: true,
+  eyeColor: 'aqua', debug: false,
 };
+const cfg = { ...DEFAULTS, ...store.get('cfg', {}) };
+if (store.get('cfg', null) === null && store.get('gain', null) !== null) {   // 旧版の設定を引き継ぐ
+  cfg.gain = +store.get('gain', cfg.gain); cfg.upBias = +store.get('upBias', cfg.upBias);
+  cfg.follow = store.get('follow', cfg.follow); cfg.invX = !!store.get('invX', false); cfg.invY = !!store.get('invY', false); cfg.debug = !!store.get('debug', false);
+}
+const saveCfg = () => store.set('cfg', cfg);
+
+/* ========= DOM ========= */
+const face = $('#face'), ctx = face.getContext('2d');
+const cam = $('#cam');
+const thumb = $('#thumb'), tctx = thumb.getContext('2d');
+const stEl = $('#status'), stText = $('#stText'), fpsEl = $('#fps');
+const valsEl = $('#vals'), logEl = $('#log'), msgEl = $('#msg'), capEl = $('#caption');
+const btnTalk = $('#btnTalk'), talkLabel = $('#talkLabel');
+const snapCanvas = document.createElement('canvas');
+
+/* ========= 状態 ========= */
+const S = {
+  target: { x: 0, y: 0 }, pupil: { x: 0, y: 0 },   // 目の向き -1..1
+  micro: { x: 0, y: 0 },                           // 微小な視線の揺れ
+  conv: 0, convT: 0,
+  blinkAt: -1, nextBlink: 0, lastSyncBlink: 0,
+  faceAt: -1e9, faceSeen: false, lastFaceLost: -1e9,
+  looking: false, lookSince: 0, notLookSince: 0, contact: false,
+  touchUntil: 0, idleNext: 0, microNext: 0, mode: 'idle',
+  expr: 'neutral', exprUntil: 0,                   // 一時的な表情
+  override: null,                                  // 視線の強制（考え中など）
+  listening: false, thinking: false, speaking: false, busy: false,
+  lastTalkAt: -1e9, lastGreetAt: -1e9,
+  vals: null, detCount: 0, detFps: 0, detFpsAt: 0,
+  stretchX: 1, stretchY: 1, prevPos: null,
+};
+let landmarker = null, lastDetect = 0, lastT = 0, W = 0, H = 0, wakeLock = null;
+
+/* ========= 表情プリセット =========
+   L = 画面左の目, R = 画面右の目。値は基準サイズに対する比率。
+   w,h: 大きさ  r: 角の丸み(0..1)  rt: 上側の角の丸み(省略時 r)
+   lidTop: 上まぶたの下がり(0..1)  lidSlant: 上まぶたの傾き(+ 内側が下がる=怒り / - 外側が下がる=悲しみ)
+   lidBot: 下まぶたの持ち上がり(0..1、弧を描く=笑い)  dy: 上下位置  tilt: 傾き(rad) */
+const BASE = { w: 1, h: 1, r: .40, rt: null, lidTop: 0, lidSlant: 0, lidBot: 0, dy: 0, tilt: 0 };
+const PRESETS = {
+  neutral:   { L: {}, R: {} },
+  happy:     { L: { lidBot: .58, h: .96, dy: -.03 }, R: { lidBot: .58, h: .96, dy: -.03 } },
+  excited:   { L: { w: 1.08, h: 1.18, r: .5, lidBot: .32, dy: -.06 }, R: { w: 1.08, h: 1.18, r: .5, lidBot: .32, dy: -.06 } },
+  curious:   { L: { h: 1.14, w: 1.04, r: .44, tilt: .09, dy: -.02 }, R: { h: .70, lidTop: .10, dy: .06, tilt: .09 } },
+  surprised: { L: { w: 1.14, h: 1.36, r: .5, dy: -.05 }, R: { w: 1.14, h: 1.36, r: .5, dy: -.05 } },
+  sad:       { L: { h: .86, lidSlant: -.6, lidTop: .22, dy: .06 }, R: { h: .86, lidSlant: -.6, lidTop: .22, dy: .06 } },
+  sleepy:    { L: { lidTop: .6, h: .9, lidBot: .15 }, R: { lidTop: .6, h: .9, lidBot: .15 } },
+  thinking:  { L: { lidTop: .26, h: .92 }, R: { lidTop: .38, h: .80, dy: .02 } },
+  annoyed:   { L: { lidTop: .44, lidSlant: .5, h: .9, rt: .12 }, R: { lidTop: .44, lidSlant: .5, h: .9, rt: .12 } },
+  listening: { L: { w: 1.04, h: 1.1, r: .46, dy: -.04, lidBot: .1 }, R: { w: 1.04, h: 1.1, r: .46, dy: -.04, lidBot: .1 } },
+};
+const P = { L: { ...BASE }, R: { ...BASE } };     // 現在値（目標へ滑らかに追従）
+const eyeCanvas = { L: document.createElement('canvas'), R: document.createElement('canvas') };
+
+function setExpr(name, ms = 6000) {
+  if (!PRESETS[name]) name = 'neutral';
+  S.expr = name; S.exprUntil = performance.now() + ms;
+}
+function baseExpr(now) {
+  if (S.listening) return 'listening';
+  if (S.thinking) return 'thinking';
+  if (S.mode === 'contact') return 'happy';
+  if (S.mode === 'idle' && now - S.faceAt > SLEEPY_MS) return 'sleepy';
+  return 'neutral';
+}
 
 /* ========= キャンバス ========= */
+let dpr = 1;
 function resize() {
-  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  dpr = Math.min(window.devicePixelRatio || 1, 2);
   W = window.innerWidth; H = window.innerHeight;
   face.width = Math.round(W * dpr); face.height = Math.round(H * dpr);
   face.style.width = W + 'px'; face.style.height = H + 'px';
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const g = geom();
+  for (const k of ['L', 'R']) { eyeCanvas[k].width = Math.round(g.ew * 1.8 * dpr); eyeCanvas[k].height = Math.round(g.eh * 1.9 * dpr); }
 }
-window.addEventListener('resize', resize); resize();
+window.addEventListener('resize', resize);
+function geom() {
+  const portrait = H >= W;
+  const ew = portrait ? Math.min(W * 0.27, H * 0.17) : Math.min(W * 0.17, H * 0.27);
+  return { ew, eh: ew * 1.22, gap: ew * 0.55, cy: H * 0.43 };
+}
 
-function drawEye(cx, cy, ew, eh, side, now) {
-  const ir = ew * 0.30;                                  // 虹彩半径
-  const px = (ew / 2 - ir) * 0.92, py = (eh / 2 - ir) * 0.92;
-  const ox = px * S.pupil.x + side * S.conv * ew * 0.07;  // side: +1=左目(右へ寄る) -1=右目
-  const oy = py * S.pupil.y;
-  const hot = S.happy;                                   // 0..1 目が合っている度合い
+function rrect(c, x, y, w, h, rt, rb) {
+  rt = Math.min(rt, w / 2, h / 2); rb = Math.min(rb, w / 2, h / 2);
+  c.beginPath();
+  c.moveTo(x + rt, y);
+  c.lineTo(x + w - rt, y); c.arcTo(x + w, y, x + w, y + rt, rt);
+  c.lineTo(x + w, y + h - rb); c.arcTo(x + w, y + h, x + w - rb, y + h, rb);
+  c.lineTo(x + rb, y + h); c.arcTo(x, y + h, x, y + h - rb, rb);
+  c.lineTo(x, y + rt); c.arcTo(x, y, x + rt, y, rt);
+  c.closePath();
+}
 
+/* 目を1つ、オフスクリーンに描いてから本体へ（まぶたで削った形のまま光らせるため） */
+function drawEye(side, p, cx, cy, g, now, blinkAmt) {
+  const oc = eyeCanvas[side], c = oc.getContext('2d');
+  const ocw = oc.width / dpr, och = oc.height / dpr;
+  c.setTransform(dpr, 0, 0, dpr, 0, 0); c.clearRect(0, 0, ocw, och);
+  c.save(); c.translate(ocw / 2, och / 2); c.rotate(p.tilt);
+
+  const breath = 1 + 0.012 * Math.sin(now / 1000 * Math.PI * 2 / 3.6);
+  const talk = S.speaking ? 1 + 0.06 * Math.sin(now / 1000 * Math.PI * 2 * 5.3) * (0.6 + 0.4 * Math.sin(now / 1000 * 7.1)) : 1;
+  const w = g.ew * p.w * S.stretchX * (1 + 0.08 * blinkAmt);
+  const h = g.eh * p.h * S.stretchY * breath * talk * (1 - blinkAmt * 0.94);
+  const [col, hot] = COLORS[cfg.eyeColor] || COLORS.aqua;
+  const rb = p.r * Math.min(w, h) / 2, rt = (p.rt ?? p.r) * Math.min(w, h) / 2;
+
+  // 本体（上がわずかに明るい）
+  const grad = c.createLinearGradient(0, -h / 2, 0, h / 2);
+  grad.addColorStop(0, hot); grad.addColorStop(0.55, col); grad.addColorStop(1, col);
+  rrect(c, -w / 2, -h / 2, w, h, rt, rb); c.fillStyle = grad; c.fill();
+  // ハイライト（まぶたが下がっているときはその下へ）
+  const hy = -h / 2 + h * (0.24 + Math.max(0, p.lidTop) + Math.max(0, p.lidSlant) * 0.2);
+  c.globalAlpha = 0.55 * (1 - Math.min(1, p.lidBot * 0.6)); c.fillStyle = '#fff';
+  c.beginPath(); c.ellipse(-w * 0.18 * (side === 'L' ? -1 : 1), hy, w * 0.09, h * 0.06, 0, 0, Math.PI * 2); c.fill();
+  c.globalAlpha = 1;
+
+  // まぶたで削る
+  c.globalCompositeOperation = 'destination-out';
+  const top = -h / 2, inner = side === 'L' ? 1 : -1;   // 内側 = 画面中央寄り
+  if (p.lidTop > 0.002 || Math.abs(p.lidSlant) > 0.002) {
+    const lid = Math.max(p.lidTop, 0);
+    const yIn = top + h * (lid + p.lidSlant * 0.35), yOut = top + h * (lid - p.lidSlant * 0.35);
+    const yL = inner > 0 ? yOut : yIn, yR = inner > 0 ? yIn : yOut;
+    c.beginPath(); c.moveTo(-w, -h * 2); c.lineTo(w, -h * 2); c.lineTo(w, yR);
+    c.quadraticCurveTo(0, (yL + yR) / 2 + h * 0.08 * lid, -w, yL); c.closePath(); c.fill();
+  }
+  if (p.lidBot > 0.002) {
+    c.beginPath(); c.ellipse(0, top + h * (1.62 - p.lidBot), w * 0.66, h * 0.56, 0, 0, Math.PI * 2); c.fill();
+  }
+  c.globalCompositeOperation = 'source-over';
+  c.restore();
+
+  // 本体キャンバスへ（光彩つき）
+  const glow = S.mode === 'contact' || S.expr === 'excited' ? 30 : 18;
   ctx.save();
-  ctx.beginPath(); ctx.ellipse(cx, cy, ew / 2, eh / 2, 0, 0, Math.PI * 2);
-  ctx.fillStyle = getCSS('--sclera'); ctx.fill(); ctx.clip();
-
-  // 虹彩
-  const irisCol = mix(getCSS('--iris'), getCSS('--iris-hot'), hot);
-  const g = ctx.createRadialGradient(cx + ox, cy + oy, ir * 0.2, cx + ox, cy + oy, ir);
-  g.addColorStop(0, irisCol); g.addColorStop(1, shade(irisCol, -0.35));
-  ctx.shadowColor = irisCol; ctx.shadowBlur = 8 + 22 * hot;
-  ctx.beginPath(); ctx.arc(cx + ox, cy + oy, ir * (1 + 0.06 * hot), 0, Math.PI * 2);
-  ctx.fillStyle = g; ctx.fill(); ctx.shadowBlur = 0;
-  // 瞳孔
-  ctx.beginPath(); ctx.arc(cx + ox, cy + oy, ir * (0.46 - 0.08 * hot), 0, Math.PI * 2);
-  ctx.fillStyle = getCSS('--pupil'); ctx.fill();
-  // ハイライト
-  ctx.beginPath(); ctx.arc(cx + ox - ir * 0.32, cy + oy - ir * 0.36, ir * 0.17, 0, Math.PI * 2);
-  ctx.fillStyle = 'rgba(255,255,255,.92)'; ctx.fill();
-  ctx.beginPath(); ctx.arc(cx + ox + ir * 0.28, cy + oy + ir * 0.30, ir * 0.08, 0, Math.PI * 2);
-  ctx.fillStyle = 'rgba(255,255,255,.55)'; ctx.fill();
-
-  // まぶた（上）: 瞬き＋眠さ
-  const blink = S.blinkAt >= 0 ? Math.sin(Math.PI * clamp((now - S.blinkAt) / 260, 0, 1)) : 0;
-  const lid = clamp(Math.max(S.lidBase, ease(blink)), 0, 1);
-  ctx.fillStyle = getCSS('--bg');
-  if (lid > 0) {
-    ctx.beginPath();
-    ctx.moveTo(cx - ew, cy - eh);
-    ctx.lineTo(cx + ew, cy - eh);
-    ctx.lineTo(cx + ew, cy - eh / 2 + eh * lid * 1.05);
-    ctx.quadraticCurveTo(cx, cy - eh / 2 + eh * lid * 1.25, cx - ew, cy - eh / 2 + eh * lid * 1.05);
-    ctx.closePath(); ctx.fill();
-  }
-  // まぶた（下）: 目が合うと弧を描いて持ち上がる＝笑う
-  if (hot > 0.01) {
-    const rise = eh * 0.95 * hot;
-    ctx.beginPath();
-    ctx.moveTo(cx - ew, cy + eh);
-    ctx.lineTo(cx - ew, cy + eh / 2 + 2);
-    ctx.quadraticCurveTo(cx, cy + eh / 2 - rise, cx + ew, cy + eh / 2 + 2);
-    ctx.lineTo(cx + ew, cy + eh); ctx.closePath(); ctx.fill();
-  }
+  ctx.shadowColor = col; ctx.shadowBlur = glow;
+  ctx.drawImage(oc, cx - ocw / 2, cy + p.dy * g.eh - och / 2, ocw, och);
   ctx.restore();
 }
 
-function render(now) {
-  ctx.fillStyle = getCSS('--bg'); ctx.fillRect(0, 0, W, H);
-  const portrait = H >= W;
-  const ew = portrait ? Math.min(W * 0.34, H * 0.2) : Math.min(W * 0.2, H * 0.34);
-  const eh = ew * 1.15, gap = ew * 0.42, cy = H * 0.44;
-  drawEye(W / 2 - gap / 2 - ew / 2, cy, ew, eh, +1, now);
-  drawEye(W / 2 + gap / 2 + ew / 2, cy, ew, eh, -1, now);
+function blinkAmount(now) {
+  if (S.blinkAt < 0) return 0;
+  const t = now - S.blinkAt;
+  if (t < 80) return t / 80;
+  if (t < 120) return 1;
+  if (t < 290) return 1 - (t - 120) / 170;
+  S.blinkAt = -1; return 0;
 }
 
-/* 色ヘルパ（CSS変数→hex→補間） */
-const cssCache = {};
-function getCSS(name) { return cssCache[name] ??= getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
-function hex2rgb(h) { h = h.replace('#', ''); if (h.length === 3) h = h.split('').map(c => c + c).join(''); const n = parseInt(h, 16); return [(n >> 16) & 255, (n >> 8) & 255, n & 255]; }
-function rgb2hex(r) { return '#' + r.map(v => clamp(Math.round(v), 0, 255).toString(16).padStart(2, '0')).join(''); }
-function mix(a, b, t) { const A = hex2rgb(a), B = hex2rgb(b); return rgb2hex(A.map((v, i) => lerp(v, B[i], t))); }
-function shade(h, k) { const c = hex2rgb(h); return rgb2hex(c.map(v => k < 0 ? v * (1 + k) : v + (255 - v) * k)); }
+function render(now) {
+  ctx.fillStyle = '#0b0f1a'; ctx.fillRect(0, 0, W, H);
+  const g = geom();
+  const gx = (S.pupil.x + S.micro.x) * W * 0.10, gy = (S.pupil.y + S.micro.y) * H * 0.06;
+  const cv = S.conv * g.ew * 0.06;
+  const blink = blinkAmount(now);
+  const lx = W / 2 - g.gap / 2 - g.ew / 2 + gx + cv, rx = W / 2 + g.gap / 2 + g.ew / 2 + gx - cv, cy = g.cy + gy;
+  // 速く動くと動く方向に伸びる（スクワッシュ＆ストレッチ）
+  if (S.prevPos) {
+    const dt = Math.max(1, now - S.prevPos.t) / 1000;
+    const vx = Math.abs(lx - S.prevPos.x) / dt / g.ew, vy = Math.abs(cy - S.prevPos.y) / dt / g.ew;
+    const sp = Math.min(6, Math.hypot(vx, vy));
+    const tx = vx >= vy ? 1 + 0.03 * sp : 1 - 0.015 * sp, ty = vx >= vy ? 1 - 0.015 * sp : 1 + 0.03 * sp;
+    S.stretchX = lerp(S.stretchX, tx, 0.35); S.stretchY = lerp(S.stretchY, ty, 0.35);
+  }
+  S.prevPos = { x: lx, y: cy, t: now };
+  drawEye('L', P.L, lx, cy, g, now, blink);
+  drawEye('R', P.R, rx, cy, g, now, blink);
+}
 
 /* ========= アニメーション更新 ========= */
 function update(now) {
   const dt = Math.min(0.05, (now - lastT) / 1000 || 0.016); lastT = now;
 
-  // 瞳: 大きく動くときはサッケード（速く）、小さい動きは滑らかに
-  const dist = Math.hypot(S.target.x - S.pupil.x, S.target.y - S.pupil.y);
-  const tau = dist > 0.35 ? 0.045 : 0.13;
-  const k = 1 - Math.exp(-dt / tau);
-  S.pupil.x = lerp(S.pupil.x, S.target.x, k);
-  S.pupil.y = lerp(S.pupil.y, S.target.y, k);
-  S.conv  = lerp(S.conv,  S.convT,  1 - Math.exp(-dt / 0.25));
-  S.happy = lerp(S.happy, S.happyT, 1 - Math.exp(-dt / 0.22));
+  // 目の向き
+  let tx = S.target.x, ty = S.target.y;
+  if (S.override && now < S.override.until) { tx = S.override.x; ty = S.override.y; }
+  const dist = Math.hypot(tx - S.pupil.x, ty - S.pupil.y);
+  const k = 1 - Math.exp(-dt / (dist > 0.35 ? 0.05 : 0.13));
+  S.pupil.x = lerp(S.pupil.x, tx, k); S.pupil.y = lerp(S.pupil.y, ty, k);
+  S.conv = lerp(S.conv, S.convT, 1 - Math.exp(-dt / 0.25));
+  // 微小な揺れ
+  if (now > S.microNext) { S.micro.x = (Math.random() - 0.5) * 0.08; S.micro.y = (Math.random() - 0.5) * 0.05; S.microNext = now + 1200 + Math.random() * 2500; }
+  S.micro.x *= Math.exp(-dt / 0.6); S.micro.y *= Math.exp(-dt / 0.6);
 
-  // 瞬き
-  if (S.blinkAt >= 0 && now - S.blinkAt > 260) S.blinkAt = -1;
-  if (S.blinkAt < 0 && now > S.nextBlink) { S.blinkAt = now; S.nextBlink = now + 2500 + Math.random() * 3500; }
+  // 瞬き（たまに二度瞬き）
+  if (S.blinkAt < 0 && now > S.nextBlink) { S.blinkAt = now; S.nextBlink = now + (Math.random() < 0.15 ? 380 : 2600 + Math.random() * 3800); }
 
-  // モード判定
+  // モード
   const touching = now < S.touchUntil;
   const faceSeen = now - S.faceAt < FACE_LOST_MS;
-  if (touching) {
-    S.mode = 'touch'; S.lidBase = 0; S.happyT = 0;
-  } else if (faceSeen) {
-    S.mode = S.contact ? 'contact' : 'track'; S.lidBase = 0;
-    S.happyT = S.contact ? 1 : 0;
-  } else {
-    // アイドル: 視線をゆっくり泳がせる
-    if (S.mode !== 'idle') { S.mode = 'idle'; S.idleNext = now + 800; S.contact = false; S.looking = false; }
-    S.happyT = 0; S.convT = 0;
-    if (now > S.idleNext) {
-      S.target.x = (Math.random() - 0.5) * 1.1; S.target.y = (Math.random() - 0.5) * 0.7 - 0.05;
-      S.idleNext = now + 1400 + Math.random() * 2200;
-    }
-    S.lidBase = now - S.faceAt > SLEEPY_MS ? 0.45 : 0;
+  if (faceSeen !== S.faceSeen) {
+    S.faceSeen = faceSeen;
+    if (faceSeen) { if (S.mode === 'idle') { setExpr(now - S.lastFaceLost > 5000 ? 'surprised' : 'curious', 900); setTimeout(() => setExpr('excited', 1200), 900); } log('顔を見つけた'); emit('face'); }
+    else { S.lastFaceLost = now; setExpr('curious', 1800); log('顔を見失った'); emit('lost'); }
   }
+  if (touching) { S.mode = 'touch'; }
+  else if (faceSeen) { S.mode = S.contact ? 'contact' : 'track'; }
+  else {
+    if (S.mode !== 'idle') { S.mode = 'idle'; S.idleNext = now + 800; S.contact = false; S.looking = false; }
+    S.convT = 0;
+    if (now > S.idleNext) {
+      S.target.x = (Math.random() - 0.5) * 1.2; S.target.y = (Math.random() - 0.5) * 0.7 - 0.05;
+      S.idleNext = now + 1400 + Math.random() * 2400;
+    }
+  }
+
+  // 表情の追従
+  const name = now < S.exprUntil ? S.expr : baseExpr(now);
+  const preset = PRESETS[name] || PRESETS.neutral;
+  const ke = 1 - Math.exp(-dt / 0.11);
+  for (const side of ['L', 'R']) {
+    const t = { ...BASE, ...preset[side] };
+    for (const key in BASE) {
+      const target = t[key] ?? (key === 'rt' ? t.r : 0), cur = P[side][key] ?? (key === 'rt' ? P[side].r : 0);
+      P[side][key] = lerp(cur, target, ke);
+    }
+  }
+
   // ステータス
-  const txt = { idle: S.lidBase > 0 ? '誰もいない…（眠い）' : '顔を探しています', track: '追従中', contact: '目が合っています', touch: 'タッチ操作中' }[S.mode];
-  const cls = { idle: '', track: 'track', contact: 'contact', touch: 'warn' }[S.mode];
-  if (stText.textContent !== txt) setStatus(cls, txt);
+  const txt = S.listening ? '聞いています' : S.thinking ? '考え中…' : S.speaking ? '話しています' :
+    { idle: now - S.faceAt > SLEEPY_MS ? '誰もいない…（眠い）' : '顔を探しています', track: '追従中', contact: '目が合っています', touch: 'タッチ操作中' }[S.mode];
+  const cls = S.listening ? 'warn' : { idle: '', track: 'track', contact: 'contact', touch: 'warn' }[S.mode];
+  if (stText.textContent !== txt) { stEl.className = cls; stText.textContent = txt; }
 }
 
 function frame(now) {
@@ -299,74 +459,76 @@ function frame(now) {
   render(now);
   requestAnimationFrame(frame);
 }
-requestAnimationFrame(frame);
 
-/* ========= 顔認識 → 瞳目標・視線判定 ========= */
+/* ========= 顔認識 → 目の向き・視線判定 ========= */
 function detect(now) {
   const res = landmarker.detectForVideo(cam, performance.now());
   S.detCount++;
   if (now - S.detFpsAt > 1000) { S.detFps = S.detCount; S.detCount = 0; S.detFpsAt = now; fpsEl.textContent = S.detFps + 'fps'; }
-
   const lm = res.faceLandmarks && res.faceLandmarks[0];
-  if (!lm) { S.vals = null; if (!$('#debug').hidden) drawThumb(null); return; }
+  if (!lm) { S.vals = null; if (cfg.debug) drawThumb(null); return; }
   S.faceAt = now;
 
-  // --- ① 顔位置 → 瞳目標。前面カメラは鏡像にして「相手がいる側」へ向ける
+  /* すべて「カメラ画像の座標」(+x = 画像右, +y = 画像下、鏡像前) で計算し、最後に左右を反転して画面へ */
   const nose = lm[1];
-  const fx = (1 - nose.x) - 0.5;      // + = 画面右
-  const fy = nose.y - 0.5;            // + = 画面下
-  const gain = parseFloat(gainEl.value), upBias = parseFloat(upBiasEl.value);
-  if (now >= S.touchUntil) {
-    S.target.x = clamp(fx * gain * 2, -1, 1);
-    S.target.y = clamp(fy * gain * 2 - upBias, -1, 1);  // カメラは画面上端にあるので少し上目に
-  }
+  const px = nose.x - 0.5, py = nose.y - 0.5;
 
-  // --- 距離: 変換行列の平行移動z（概ねcm）。無ければ頬幅から推定
   const m = res.facialTransformationMatrixes && res.facialTransformationMatrixes[0] && res.facialTransformationMatrixes[0].data;
   const cheek = Math.hypot(lm[454].x - lm[234].x, lm[454].y - lm[234].y);
-  let distCm = m ? Math.abs(m[14]) : (12 / Math.max(cheek, 0.05));
+  const distCm = m ? Math.abs(m[14]) : (12 / Math.max(cheek, 0.05));
   S.convT = clamp((65 - distCm) / 40, 0, 1);
 
-  // --- 頭の向き（度）。列優先4x4から yaw/pitch を抽出
-  let yaw = 0, pitch = 0;
-  if (m) {
-    yaw   = Math.atan2(m[8], m[10]) * 180 / Math.PI;
-    pitch = Math.asin(clamp(-m[9], -1, 1)) * 180 / Math.PI;
-  }
+  let yaw = 0, pitch = 0;   // + = 相手の左（画像右）/ + = 下向き
+  if (m) { yaw = Math.atan2(m[8], m[10]) * 180 / Math.PI; pitch = Math.asin(clamp(-m[9], -1, 1)) * 180 / Math.PI; }
+  const vw = cam.videoWidth || 4, vh = cam.videoHeight || 3, vmax = Math.max(vw, vh);
+  const relYaw = yaw + px * FOV_DEG * vw / vmax;        // カメラ軸からの相対角
+  const relPitch = pitch + py * FOV_DEG * vh / vmax;
 
-  // --- ② 眼球の向き（ブレンドシェイプ 0..1）。Left/Right は相手から見た左右
+  const eyeOff = (iris, a, b) => { const w = Math.abs(b.x - a.x) || 1e-3; return (iris.x - (a.x + b.x) / 2) / w; };
+  const eyeX = lm[468] && lm[473] ? (eyeOff(lm[468], lm[33], lm[133]) + eyeOff(lm[473], lm[362], lm[263])) / 2 : 0;  // + = 画像右
   const bs = {};
   if (res.faceBlendshapes && res.faceBlendshapes[0]) for (const c of res.faceBlendshapes[0].categories) bs[c.categoryName] = c.score;
   const g = n => bs[n] || 0;
-  const gazeX = ((g('eyeLookOutLeft') + g('eyeLookInRight')) - (g('eyeLookInLeft') + g('eyeLookOutRight'))) / 2; // + = 相手の左方向
-  const gazeY = ((g('eyeLookUpLeft') + g('eyeLookUpRight')) - (g('eyeLookDownLeft') + g('eyeLookDownRight'))) / 2; // + = 上
+  const gazeY = ((g('eyeLookUpLeft') + g('eyeLookUpRight')) - (g('eyeLookDownLeft') + g('eyeLookDownRight'))) / 2;  // + = 上
   const blink = (g('eyeBlinkLeft') + g('eyeBlinkRight')) / 2;
 
-  // --- 「こちらを見ている」判定（ヒステリシス付き）
-  const lookingNow = Math.abs(yaw) < TH.yaw && Math.abs(pitch) < TH.pitch && Math.abs(gazeX) < TH.gazeX && Math.abs(gazeY) < TH.gazeY && blink < 0.6;
+  const gx = relYaw / 25 + eyeX * 6;      // 相手の視線の、こちらからの逸れ（±1程度）
+  const gy = relPitch / 20 - gazeY * 1.2;
+
+  if (now >= S.touchUntil) {
+    let tx, ty;
+    if (cfg.follow === 'gaze') { tx = px * 1.2 + gx * 0.6; ty = py * 1.2 + gy * 0.6; }
+    else { tx = px * 2; ty = py * 2; }
+    tx = -tx;                                   // 鏡像: 相手の左は画面の左
+    if (cfg.invX) tx = -tx; if (cfg.invY) ty = -ty;
+    S.target.x = clamp(tx * cfg.gain, -1, 1);
+    S.target.y = clamp(ty * cfg.gain - cfg.upBias, -1, 1);
+  }
+
+  const lookingNow = Math.abs(relYaw) < TH.yaw && relPitch > -TH.pitchUp && relPitch < TH.pitchDown
+    && Math.abs(eyeX) < TH.eyeX && Math.abs(gazeY) < TH.gazeY && blink < 0.6;
   if (lookingNow) { if (!S.looking) { S.looking = true; S.lookSince = now; } }
-  else            { if (S.looking)  { S.looking = false; S.notLookSince = now; } }
+  else if (S.looking) { S.looking = false; S.notLookSince = now; }
   if (!S.contact && S.looking && now - S.lookSince > CONTACT_ON_MS) {
     S.contact = true; log('目が合った'); emit('contact', { distCm: Math.round(distCm) });
+    setExpr('excited', 1000);
+    maybeGreet(now);
   } else if (S.contact && !S.looking && now - S.notLookSince > CONTACT_OFF_MS) {
     S.contact = false; log('視線が逸れた'); emit('away');
   }
 
-  // --- 瞬き同期: 相手が瞬いたらこちらも
-  if (S.blinkSync && blink > 0.6 && S.blinkAt < 0 && now - (S.lastSyncBlink || 0) > 900) {
-    S.blinkAt = now; S.lastSyncBlink = now; S.nextBlink = now + 2500 + Math.random() * 3500;
+  if (cfg.blinkSync && blink > 0.6 && S.blinkAt < 0 && now - S.lastSyncBlink > 900) {
+    S.blinkAt = now; S.lastSyncBlink = now; S.nextBlink = now + 2600 + Math.random() * 3800;
   }
 
-  S.vals = { fx, fy, distCm, yaw, pitch, gazeX, gazeY, blink, lm };
-  if (!$('#debug').hidden) drawThumb(S.vals);
+  S.vals = { px, py, distCm, relYaw, relPitch, eyeX, gazeY, gx, gy, blink, lm };
+  if (cfg.debug) drawThumb(S.vals);
 }
 
-/* デバッグ: 鏡像サムネイル＋数値 */
 function drawThumb(v) {
   const w = thumb.width, h = thumb.height;
   tctx.save(); tctx.clearRect(0, 0, w, h);
   if (cam.videoWidth) {
-    // cover で描画（鏡像）
     const vr = cam.videoWidth / cam.videoHeight, tr = w / h;
     let dw = w, dh = h; if (vr > tr) dw = h * vr; else dh = w / vr;
     tctx.translate(w, 0); tctx.scale(-1, 1);
@@ -376,27 +538,187 @@ function drawThumb(v) {
       const sx = x => w - ((x * dw) + (w - dw) / 2), sy = y => (y * dh) + (h - dh) / 2;
       tctx.fillStyle = '#8af5e8';
       for (const i of [1, 33, 133, 362, 263, 234, 454]) { const p = v.lm[i]; tctx.fillRect(sx(p.x) - 1.5, sy(p.y) - 1.5, 3, 3); }
-      // 虹彩
       tctx.fillStyle = '#f0b35c';
       for (const i of [468, 473]) { const p = v.lm[i]; if (p) { tctx.beginPath(); tctx.arc(sx(p.x), sy(p.y), 2.5, 0, 7); tctx.fill(); } }
-      // 視線矢印（鏡像なので x 反転）
       const n = v.lm[1], ax = sx(n.x), ay = sy(n.y);
       tctx.strokeStyle = S.contact ? '#62d49a' : '#f0b35c'; tctx.lineWidth = 2;
-      tctx.beginPath(); tctx.moveTo(ax, ay); tctx.lineTo(ax - v.gazeX * 60 - Math.sin(v.yaw * Math.PI / 180) * 40, ay - v.gazeY * 60 - Math.sin(v.pitch * Math.PI / 180) * 40); tctx.stroke();
+      tctx.beginPath(); tctx.moveTo(ax, ay); tctx.lineTo(ax - v.gx * 50, ay + v.gy * 50); tctx.stroke();
     }
   }
   tctx.restore();
   valsEl.innerHTML = v ? [
-    ['顔x,y', `${v.fx.toFixed(2)}, ${v.fy.toFixed(2)}`],
+    ['顔x,y', `${v.px.toFixed(2)}, ${v.py.toFixed(2)}`],
     ['距離', `${v.distCm.toFixed(0)} cm`],
-    ['頭yaw', `${v.yaw.toFixed(0)}°`], ['頭pitch', `${v.pitch.toFixed(0)}°`],
-    ['視線x', v.gazeX.toFixed(2)], ['視線y', v.gazeY.toFixed(2)],
+    ['頭yaw', `${v.relYaw.toFixed(0)}°`], ['頭pitch', `${v.relPitch.toFixed(0)}° ${v.relPitch > 2 ? '↓' : v.relPitch < -2 ? '↑' : '·'}`],
+    ['目x', v.eyeX.toFixed(2)], ['目y', `${v.gazeY.toFixed(2)} ${v.gazeY > 0.1 ? '↑' : v.gazeY < -0.1 ? '↓' : '·'}`],
+    ['視線', `${v.gx.toFixed(2)}, ${v.gy.toFixed(2)}`],
     ['瞬き', v.blink.toFixed(2)],
+    ['表情', performance.now() < S.exprUntil ? S.expr : baseExpr(performance.now())],
     ['判定', S.contact ? '目が合っている' : (S.looking ? '見ている→' : '見ていない')],
   ].map(([k, s]) => `<b>${k}</b>${s}`).join('\n') : '顔なし';
 }
 
-/* ========= タッチ操作（カメラなしでも目を動かせる） ========= */
+/* ========= 字幕 ========= */
+let capTimer = 0;
+function caption(text, kind = 'say', ms = 7000) {
+  capEl.textContent = text; capEl.className = kind;
+  clearTimeout(capTimer); if (ms) capTimer = setTimeout(() => capEl.classList.add('hide'), ms);
+}
+
+/* ========= 音声合成 ========= */
+let voices = [];
+function loadVoices() {
+  voices = speechSynthesis.getVoices();
+  const sel = $('#voiceURI'); const cur = cfg.voiceURI;
+  sel.innerHTML = '<option value="">自動（日本語）</option>';
+  for (const v of voices) if (/^ja/i.test(v.lang)) { const o = document.createElement('option'); o.value = v.voiceURI; o.textContent = `${v.name}`; sel.appendChild(o); }
+  sel.value = voices.some(v => v.voiceURI === cur) ? cur : '';
+}
+if ('speechSynthesis' in window) { loadVoices(); speechSynthesis.onvoiceschanged = loadVoices; }
+function pickVoice() {
+  if (cfg.voiceURI) { const v = voices.find(v => v.voiceURI === cfg.voiceURI); if (v) return v; }
+  const ja = voices.filter(v => /^ja/i.test(v.lang));
+  return ja.find(v => /Kyoko|O-ren|Otoya|Hattori/i.test(v.name)) || ja.find(v => /Siri|Premium|Enhanced/i.test(v.name)) || ja[0] || null;
+}
+let currentUtter = null;
+function speak(text) {
+  return new Promise(async resolve => {
+    if (!('speechSynthesis' in window) || !text) return resolve();
+    stopListening();
+    if (speechSynthesis.speaking || speechSynthesis.pending) { speechSynthesis.cancel(); await new Promise(r => setTimeout(r, 80)); }  // iOS: cancel 直後の speak は落ちることがある
+    const u = new SpeechSynthesisUtterance(text);
+    u.lang = 'ja-JP'; const v = pickVoice(); if (v) u.voice = v;
+    u.rate = cfg.rate; u.pitch = cfg.pitch;
+    let done = false; const fin = () => { if (done) return; done = true; S.speaking = false; resolve(); };
+    u.onstart = () => { S.speaking = true; };
+    u.onend = fin; u.onerror = fin;
+    currentUtter = u;                       // iOS で途中で消えないよう参照を保持
+    speechSynthesis.speak(u);
+    setTimeout(fin, 1500 + text.length * 400);   // 保険
+  });
+}
+function unlockAudio() { try { const u = new SpeechSynthesisUtterance(''); u.volume = 0; speechSynthesis.speak(u); } catch {} }
+
+/* ========= 音声認識 ========= */
+const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+let rec = null;
+function startListening() {
+  if (S.busy || S.listening) return;
+  if (!SR) { caption('この端末では音声認識が使えません。「文字」で入力してください', 'err'); $('#textRow').hidden = false; return; }
+  if (speechSynthesis.speaking || speechSynthesis.pending) speechSynthesis.cancel();
+  S.speaking = false;
+  rec = new SR(); rec.lang = 'ja-JP'; rec.interimResults = true; rec.continuous = false; rec.maxAlternatives = 1;
+  let text = '', final = '';
+  rec.onresult = e => {
+    text = ''; for (let i = 0; i < e.results.length; i++) text += e.results[i][0].transcript;
+    if (e.results[e.results.length - 1].isFinal) final = text;
+    caption(`「${text}」`, 'heard', 0);
+  };
+  rec.onerror = e => { if (e.error !== 'no-speech' && e.error !== 'aborted') caption('音声認識エラー: ' + e.error, 'err'); };
+  rec.onend = () => {
+    S.listening = false; btnTalk.classList.remove('listening'); talkLabel.textContent = '話す';
+    if (cam.srcObject && cam.paused) cam.play().catch(() => {});
+    const t = (final || text).trim();
+    if (t) converse(t); else if (!S.busy) capEl.classList.add('hide');
+  };
+  try { rec.start(); S.listening = true; btnTalk.classList.add('listening'); talkLabel.textContent = '聞き取り中'; caption('どうぞ…', 'heard', 0); }
+  catch (e) { caption('マイクを開始できません: ' + e.message, 'err'); }
+}
+function stopListening() { if (rec && S.listening) { try { rec.stop(); } catch {} } }
+
+/* ========= Claude ========= */
+let history = [];
+function systemPrompt() {
+  return `あなたは机の上に置かれた小さなロボット「${cfg.name}」です。顔は画面の2つの目だけで、目の形で気持ちを表します。
+性格・話し方: ${cfg.persona}
+
+ルール:
+- 日本語の話し言葉で、短く返す（1〜2文、だいたい40文字以内）。長い説明はしない。
+- 相手のメッセージ先頭の [状況 …] は、あなたのセンサーからの情報（時刻・相手との距離・相手がこちらを見ているか）。必要なときだけ自然に触れる。
+- 画像が付いていたら、それはあなたの目（カメラ）に今見えている光景。聞かれたときや面白いものがあるときだけ、さりげなく触れる。
+- 「(システム: …)」で始まるメッセージは、相手の発言ではなくあなたへの合図。
+- 返答は必ず次の JSON だけを返す。前後に文章や \`\`\` を付けない:
+{"say":"話す内容","emotion":"${EMOTIONS.join('|')}"}`;
+}
+function situation() {
+  const t = new Date(); const hm = `${t.getHours()}:${String(t.getMinutes()).padStart(2, '0')}`;
+  const v = S.vals;
+  return `[状況 ${hm}${S.faceSeen && v ? ` / 相手との距離 約${Math.round(v.distCm)}cm / ${S.contact ? 'こちらを見ている' : 'よそを見ている'}` : ' / 顔は見えていない'}]`;
+}
+function snapshot() {
+  const vw = cam.videoWidth, vh = cam.videoHeight; if (!vw || !vh) return null;
+  const s = 320 / Math.max(vw, vh);
+  snapCanvas.width = Math.round(vw * s); snapCanvas.height = Math.round(vh * s);
+  snapCanvas.getContext('2d').drawImage(cam, 0, 0, snapCanvas.width, snapCanvas.height);
+  return snapCanvas.toDataURL('image/jpeg', 0.6).split(',')[1];
+}
+function parseReply(text) {
+  const tryParse = s => { try { const o = JSON.parse(s); if (o && typeof o.say === 'string') return o; } catch {} return null; };
+  let o = tryParse(text.trim());
+  if (!o) { const m = text.match(/\{[\s\S]*\}/); if (m) o = tryParse(m[0]); }
+  if (!o) o = { say: text.replace(/```[a-z]*|```/g, '').trim().slice(0, 120), emotion: 'neutral' };
+  if (!EMOTIONS.includes(o.emotion)) o.emotion = 'neutral';
+  return o;
+}
+async function callClaude(messages, { maxTokens = 300, system = systemPrompt() } = {}) {
+  const r = await fetch(API_URL, {
+    method: 'POST',
+    headers: { 'x-api-key': cfg.apiKey, 'anthropic-version': '2023-06-01', 'content-type': 'application/json', 'anthropic-dangerous-direct-browser-access': 'true' },
+    body: JSON.stringify({ model: cfg.model || DEFAULTS.model, max_tokens: maxTokens, system, messages }),
+  });
+  if (!r.ok) {
+    let detail = ''; try { detail = (await r.json()).error?.message || ''; } catch {}
+    const msg = r.status === 401 ? 'APIキーが正しくありません' : r.status === 404 || /model/i.test(detail) && r.status === 400 ? `モデル名を確認してください（${cfg.model}）` :
+      r.status === 429 ? '混み合っています。少し待ってください' : r.status >= 500 ? 'Claude 側が混雑中です' : `HTTP ${r.status} ${detail}`;
+    throw new Error(msg);
+  }
+  const data = await r.json();
+  return data.content.filter(c => c.type === 'text').map(c => c.text).join('');
+}
+async function askClaude(userText) {
+  const content = [];
+  const img = cfg.sendImage ? snapshot() : null;
+  if (img) content.push({ type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: img } });
+  content.push({ type: 'text', text: `${situation()}\n${userText}` });
+  history.push({ role: 'user', content });
+  history = history.slice(-12);
+  // 画像は最新の発言にだけ残す（トークン節約）
+  const messages = history.map((m, i) => i === history.length - 1 ? m : { role: m.role, content: Array.isArray(m.content) ? m.content.filter(c => c.type !== 'image') : m.content });
+  const text = await callClaude(messages);
+  const reply = parseReply(text);
+  history.push({ role: 'assistant', content: JSON.stringify({ say: reply.say, emotion: reply.emotion }) });
+  return reply;
+}
+async function converse(text, kind = 'user') {
+  if (S.busy) return;
+  if (!cfg.apiKey) { caption('設定で Claude の APIキーを入れてください', 'err'); openSheet(); return; }
+  S.busy = true; S.thinking = true; btnTalk.classList.add('busy'); talkLabel.textContent = '考え中';
+  S.override = { x: 0.55, y: -0.6, until: performance.now() + 20000 };
+  if (kind === 'user') caption(`「${text}」`, 'heard', 0);
+  try {
+    const reply = await askClaude(kind === 'user' ? text : `(システム: ${text})`);
+    S.thinking = false; S.override = null;
+    setExpr(reply.emotion, 9000);
+    caption(reply.say, 'say', 12000);
+    log(`${reply.emotion}: ${reply.say}`);
+    await speak(reply.say);
+    S.lastTalkAt = performance.now();
+    S.busy = false; btnTalk.classList.remove('busy'); talkLabel.textContent = '話す';
+    if (cfg.continuous && kind === 'user') startListening();
+  } catch (e) {
+    S.thinking = false; S.override = null; setExpr('sad', 3000);
+    caption((e instanceof TypeError ? '通信できませんでした（オフライン？）' : e.message), 'err', 9000);
+    log('エラー: ' + e.message);
+  } finally { S.busy = false; btnTalk.classList.remove('busy'); if (!S.listening) talkLabel.textContent = '話す'; }
+}
+function maybeGreet(now) {
+  if (!cfg.greet || !cfg.apiKey || S.busy || !$('#start').hidden) return;
+  if (now - S.lastTalkAt < GREET_IDLE_MS || now - S.lastGreetAt < GREET_COOLDOWN_MS) return;
+  S.lastGreetAt = now;
+  converse('相手と目が合いました。見えている様子に軽く触れつつ、短くひとこと話しかけてください。', 'event');
+}
+
+/* ========= タッチ操作 ========= */
 function onPointer(e) {
   const r = face.getBoundingClientRect();
   S.target.x = clamp(((e.clientX - r.left) / r.width - 0.5) * 2.2, -1, 1);
@@ -405,55 +727,85 @@ function onPointer(e) {
 }
 face.addEventListener('pointerdown', e => { onPointer(e); face.setPointerCapture(e.pointerId); });
 face.addEventListener('pointermove', e => { if (e.buttons || e.pointerType === 'touch') onPointer(e); });
-face.addEventListener('dblclick', () => { S.happyT = S.happyT > .5 ? 0 : 1; }); // 笑顔の見た目確認用
+let lastTap = 0, exprIdx = 0;
+face.addEventListener('pointerup', () => {
+  const now = performance.now();
+  if (now - lastTap < 320) { exprIdx = (exprIdx + 1) % EMOTIONS.length; setExpr(EMOTIONS[exprIdx], 2500); caption(`表情: ${EMOTIONS[exprIdx]}`, 'heard', 1500); lastTap = 0; }
+  else lastTap = now;
+});
 
 /* ========= 起動 ========= */
 async function startCamera() {
-  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-    throw new Error(location.protocol === 'https:' ? 'このブラウザはカメラAPIに対応していません' : 'カメラは https:// で開いたページでのみ使えます');
-  }
+  if (!navigator.mediaDevices?.getUserMedia) throw new Error(location.protocol === 'https:' ? 'このブラウザはカメラAPIに対応していません' : 'カメラは https:// で開いたページでのみ使えます');
   const stream = await navigator.mediaDevices.getUserMedia({ audio: false, video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: 30 } } });
   cam.srcObject = stream;
   await new Promise(r => { if (cam.readyState >= 1) r(); else cam.onloadedmetadata = r; });
   await cam.play();
 }
+cam.addEventListener('pause', () => { if (cam.srcObject && !document.hidden) cam.play().catch(() => {}); });
 async function initLandmarker() {
   msgEl.textContent = '認識モデルを読み込んでいます…';
   const { FaceLandmarker, FilesetResolver } = await import(`${MP_BASE}/vision_bundle.mjs`);
   const fileset = await FilesetResolver.forVisionTasks(`${MP_BASE}/wasm`);
-  const opts = { baseOptions: { modelAssetPath: MODEL, delegate: 'GPU' }, runningMode: 'VIDEO', numFaces: 1, outputFaceBlendshapes: true, outputFacialTransformationMatrixes: true };
+  const opts = { baseOptions: { modelAssetPath: MODEL_URL, delegate: 'GPU' }, runningMode: 'VIDEO', numFaces: 1, outputFaceBlendshapes: true, outputFacialTransformationMatrixes: true };
   try { landmarker = await FaceLandmarker.createFromOptions(fileset, opts); }
   catch (e) { console.warn('GPU delegate failed, falling back to CPU', e); opts.baseOptions.delegate = 'CPU'; landmarker = await FaceLandmarker.createFromOptions(fileset, opts); }
 }
-async function keepAwake() {
-  try { wakeLock = await navigator.wakeLock?.request('screen'); } catch {}
-}
-document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && wakeLock) keepAwake(); });
+async function keepAwake() { try { wakeLock = await navigator.wakeLock?.request('screen'); } catch {} }
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') { if (wakeLock) keepAwake(); if (cam.srcObject) cam.play().catch(() => {}); } });
 
 $('#btnStart').addEventListener('click', async () => {
   $('#btnStart').disabled = true; msgEl.textContent = 'カメラを起動しています…';
-  keepAwake();
+  keepAwake(); unlockAudio();
   try {
-    await startCamera();
-    await initLandmarker();
-    $('#start').hidden = true; log('追従開始'); setStatus('', '顔を探しています');
+    await startCamera(); await initLandmarker();
+    $('#start').hidden = true; log('追従開始'); setExpr('excited', 1500);
+    if (!cfg.apiKey) caption('「設定」で Claude の APIキーを入れると話せます', 'heard', 8000);
   } catch (e) {
     console.error(e);
     msgEl.textContent = `起動できませんでした: ${e.message || e}　→「カメラなしで試す」で目の動きだけ確認できます`;
     $('#btnStart').disabled = false;
   }
 });
-$('#btnTouchOnly').addEventListener('click', () => { $('#start').hidden = true; keepAwake(); S.touchUntil = performance.now() + 1500; setStatus('warn', 'タッチ操作中'); });
+$('#btnTouchOnly').addEventListener('click', () => { $('#start').hidden = true; keepAwake(); unlockAudio(); S.touchUntil = performance.now() + 1500; setExpr('curious', 1500); });
 
-/* ========= コントロール ========= */
-$('#btnDebug').addEventListener('click', e => { const d = $('#debug'); d.hidden = !d.hidden; e.currentTarget.classList.toggle('on', !d.hidden); store.set('debug', !d.hidden); });
-$('#btnBlinkSync').addEventListener('click', e => { S.blinkSync = !S.blinkSync; e.currentTarget.classList.toggle('on', S.blinkSync); });
-$('#btnTouch').addEventListener('click', () => { S.touchUntil = performance.now() + 4000; });
-gainEl.addEventListener('input', () => store.set('gain', gainEl.value));
-upBiasEl.addEventListener('input', () => store.set('upBias', upBiasEl.value));
-gainEl.value = store.get('gain', gainEl.value); upBiasEl.value = store.get('upBias', upBiasEl.value);
-if (store.get('debug', false)) { $('#debug').hidden = false; $('#btnDebug').classList.add('on'); }
+/* ========= コントロール・設定 ========= */
+btnTalk.addEventListener('click', () => { if (S.listening) stopListening(); else if (!S.busy) startListening(); });
+$('#btnKbd').addEventListener('click', () => { const r = $('#textRow'); r.hidden = !r.hidden; if (!r.hidden) $('#txt').focus(); });
+function sendText() { const t = $('#txt').value.trim(); if (!t) return; $('#txt').value = ''; converse(t); }
+$('#btnSend').addEventListener('click', sendText);
+$('#txt').addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); sendText(); } });
+
+const sheet = $('#sheet');
+function openSheet() { sheet.hidden = false; }
+$('#btnSettings').addEventListener('click', openSheet);
+$('#btnClose').addEventListener('click', () => { sheet.hidden = true; });
+sheet.addEventListener('click', e => { if (e.target === sheet) sheet.hidden = true; });
+$('#btnClearHist').addEventListener('click', () => { history = []; $('#testResult').textContent = '会話履歴を消しました'; $('#testResult').className = ''; });
+$('#btnTest').addEventListener('click', async () => {
+  const out = $('#testResult'); out.className = ''; out.textContent = '接続中…';
+  try {
+    const t = await callClaude([{ role: 'user', content: '「接続OK」とだけ答えて' }], { maxTokens: 20, system: '短く答える' });
+    out.textContent = `OK: ${cfg.model} → ${t.trim()}`; out.className = 'ok';
+  } catch (e) { out.textContent = e instanceof TypeError ? '通信できませんでした' : e.message; out.className = 'ng'; }
+});
+document.querySelectorAll('[data-cfg]').forEach(el => {
+  const k = el.dataset.cfg, isBool = el.type === 'checkbox';
+  if (isBool) el.checked = !!cfg[k]; else el.value = cfg[k];
+  el.addEventListener(el.tagName === 'SELECT' || isBool ? 'change' : 'input', () => {
+    cfg[k] = isBool ? el.checked : el.type === 'range' ? parseFloat(el.value) : el.value;
+    saveCfg();
+    if (k === 'debug') $('#debug').hidden = !cfg.debug;
+  });
+});
+$('#debug').hidden = !cfg.debug;
+
+/* 外部連携・動作確認用: window.gazeEyes.setExpr('happy') / .say('こんにちは') */
+window.gazeEyes = { setExpr, say: t => speak(t), converse, state: S, cfg };
+
+resize();
 S.nextBlink = performance.now() + 1500;
+requestAnimationFrame(frame);
 </script>
 </body>
 </html>
