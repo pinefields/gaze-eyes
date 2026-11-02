@@ -80,6 +80,7 @@
   .field input[type=text], .field input[type=password], .field select, .field textarea { font: inherit; font-size: 14px; padding: 7px 10px; border-radius: 9px; border: 1px solid var(--line); background: var(--bg-soft); color: var(--fg); width: 56%; min-width: 0; }
   .field textarea { width: 100%; height: 4.5em; resize: vertical; }
   .field.col { flex-direction: column; align-items: stretch; }
+  .field.col select, .field.col input { width: 100%; }
   .field input[type=range] { width: 50%; accent-color: var(--accent); }
   .switch { position: relative; width: 46px; height: 28px; flex: none; }
   .switch input { opacity: 0; width: 0; height: 0; position: absolute; }
@@ -157,7 +158,15 @@
     <label class="field"><span>見たものを伝える<small>話しかけるたびにカメラ画像を1枚 Claude に送ります</small></span><span class="switch"><input type="checkbox" id="sendImage" data-cfg="sendImage"><i></i></span></label>
     <label class="field"><span>目が合ったら話しかける<small>しばらく会話がないときだけ</small></span><span class="switch"><input type="checkbox" id="greet" data-cfg="greet"><i></i></span></label>
     <label class="field"><span>返事のあと続けて聞く</span><span class="switch"><input type="checkbox" id="continuous" data-cfg="continuous"><i></i></span></label>
-    <label class="field"><span>声<small>同じ名前が複数あるのは標準版と拡張版などです。試聴で聞き比べてください</small></span><select id="voiceKey" data-cfg="voiceKey"><option value="">自動（日本語）</option></select></label>
+    <label class="field col"><span>音声エンジン<small>iPhone 内蔵は標準版の声しか使えません。自然な声はクラウドのどれかを選び、そのキーだけ入力</small></span><select id="ttsEngine" data-cfg="ttsEngine"><option value="ios">iPhone 内蔵</option><option value="google">Google Cloud TTS</option><option value="openai">OpenAI TTS</option><option value="azure">Azure Speech</option></select></label>
+    <label class="field tts-ios"><span>声（内蔵）</span><select id="voiceKey" data-cfg="voiceKey"><option value="">自動（日本語）</option></select></label>
+    <label class="field tts-google"><span>Google APIキー</span><input type="password" id="googleKey" data-cfg="googleKey" autocomplete="off" placeholder="AIza…"></label>
+    <label class="field tts-google"><span>Google の声<small>ja-JP-Neural2-B / C / D、ja-JP-Chirp3-HD-Aoede など</small></span><input type="text" id="googleVoice" data-cfg="googleVoice" placeholder="ja-JP-Neural2-B"></label>
+    <label class="field tts-openai"><span>OpenAI APIキー</span><input type="password" id="openaiKey" data-cfg="openaiKey" autocomplete="off" placeholder="sk-…"></label>
+    <label class="field tts-openai"><span>OpenAI の声<small>alloy / nova / shimmer / coral / sage など</small></span><input type="text" id="openaiVoice" data-cfg="openaiVoice" placeholder="nova"></label>
+    <label class="field tts-azure"><span>Azure キー</span><input type="password" id="azureKey" data-cfg="azureKey" autocomplete="off"></label>
+    <label class="field tts-azure"><span>Azure リージョン<small>japaneast など</small></span><input type="text" id="azureRegion" data-cfg="azureRegion" placeholder="japaneast"></label>
+    <label class="field tts-azure"><span>Azure の声<small>ja-JP-NanamiNeural / KeitaNeural / AoiNeural など</small></span><input type="text" id="azureVoice" data-cfg="azureVoice" placeholder="ja-JP-NanamiNeural"></label>
     <div class="btnrow"><button id="btnPreview">この声で試聴</button></div>
     <label class="field"><span>話す速さ</span><input type="range" id="rate" data-cfg="rate" min="0.7" max="1.5" step="0.05"></label>
     <label class="field"><span>声の高さ</span><input type="range" id="pitch" data-cfg="pitch" min="0.6" max="1.8" step="0.05"></label>
@@ -217,7 +226,8 @@ function emit(type, extra = {}) { window.dispatchEvent(new CustomEvent('gaze', {
 const DEFAULTS = {
   apiKey: '', model: 'claude-haiku-5-5', name: 'ミル',
   persona: '好奇心旺盛で、ちょっといたずら好き。相手のことを知りたがる。難しい話も身近なたとえで短く返す。語尾はやわらかく、たまに「ふむふむ」「おっ」などの相づちを入れる。',
-  voiceKey: '', rate: 1.0, pitch: 1.0,
+  ttsEngine: 'ios', voiceKey: '', rate: 1.0, pitch: 1.0,
+  googleKey: '', googleVoice: 'ja-JP-Neural2-B', openaiKey: '', openaiVoice: 'nova', azureKey: '', azureRegion: 'japaneast', azureVoice: 'ja-JP-NanamiNeural',
   sendImage: true, greet: true, continuous: false,
   follow: 'gaze', invX: false, invY: false, gain: 2.2, upBias: 0.12, blinkSync: true,
   eyeColor: 'aqua', debug: false,
@@ -575,7 +585,8 @@ const voiceQuality = v => /premium/i.test(v.voiceURI) ? 3 : /enhanced/i.test(v.v
 function loadVoices() {
   const all = speechSynthesis.getVoices();
   const count = {};
-  jaVoices = all.filter(v => /^ja/i.test(v.lang)).map(v => {
+  const seen = new Set();
+  jaVoices = all.filter(v => /^ja/i.test(v.lang)).filter(v => { const id = `${v.name}|${v.voiceURI}|${v.lang}`; if (seen.has(id)) return false; seen.add(id); return true; }).map(v => {
     const n = count[v.name] = (count[v.name] || 0) + 1;
     return { v, key: `${v.name}#${n}`, n };
   });
@@ -598,7 +609,65 @@ function pickVoice() {
   return [...jaVoices].sort((a, b) => (voiceQuality(b.v) - voiceQuality(a.v)) || (pref(b.v) - pref(a.v)))[0].v;
 }
 let currentUtter = null;
-function speak(text) {
+
+/* --- クラウド音声合成（mp3 を取得して再生）。失敗したら内蔵音声にフォールバック --- */
+const audioEl = new Audio(); audioEl.playsInline = true; audioEl.preload = 'auto';
+const SILENT_WAV = 'data:audio/wav;base64,UklGRnQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YVAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==';
+async function synthCloud(text) {
+  const e = cfg.ttsEngine;
+  if (e === 'google') {
+    if (!cfg.googleKey) throw new Error('Google APIキーが未設定');
+    const r = await fetch(`https://texttospeech.googleapis.com/v1/text:synthesize?key=${encodeURIComponent(cfg.googleKey)}`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ input: { text }, voice: { languageCode: 'ja-JP', name: cfg.googleVoice || 'ja-JP-Neural2-B' },
+        audioConfig: { audioEncoding: 'MP3', speakingRate: clamp(cfg.rate, 0.25, 4), pitch: /Chirp/i.test(cfg.googleVoice) ? 0 : clamp((cfg.pitch - 1) * 10, -20, 20) } }),
+    });
+    if (!r.ok) throw new Error(`Google TTS ${r.status}: ${(await r.text()).slice(0, 160)}`);
+    const b64 = (await r.json()).audioContent;
+    return new Blob([Uint8Array.from(atob(b64), c => c.charCodeAt(0))], { type: 'audio/mpeg' });
+  }
+  if (e === 'openai') {
+    if (!cfg.openaiKey) throw new Error('OpenAI APIキーが未設定');
+    const r = await fetch('https://api.openai.com/v1/audio/speech', {
+      method: 'POST', headers: { 'content-type': 'application/json', 'authorization': `Bearer ${cfg.openaiKey}` },
+      body: JSON.stringify({ model: 'gpt-4o-mini-tts', voice: cfg.openaiVoice || 'nova', input: text, response_format: 'mp3', speed: clamp(cfg.rate, 0.25, 4),
+        instructions: `日本語ネイティブとして自然に、${cfg.name}という小さなロボットの明るい声で話す` }),
+    });
+    if (!r.ok) throw new Error(`OpenAI TTS ${r.status}: ${(await r.text()).slice(0, 160)}`);
+    return await r.blob();
+  }
+  if (e === 'azure') {
+    if (!cfg.azureKey) throw new Error('Azure キーが未設定');
+    const esc = s => s.replace(/[<>&]/g, c => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;' }[c]));
+    const ssml = `<speak version="1.0" xml:lang="ja-JP"><voice name="${cfg.azureVoice || 'ja-JP-NanamiNeural'}"><prosody rate="${Math.round((cfg.rate - 1) * 100)}%" pitch="${Math.round((cfg.pitch - 1) * 50)}%">${esc(text)}</prosody></voice></speak>`;
+    const r = await fetch(`https://${cfg.azureRegion || 'japaneast'}.tts.speech.microsoft.com/cognitiveservices/v1`, {
+      method: 'POST', headers: { 'Ocp-Apim-Subscription-Key': cfg.azureKey, 'content-type': 'application/ssml+xml', 'X-Microsoft-OutputFormat': 'audio-24khz-48kbitrate-mono-mp3' }, body: ssml,
+    });
+    if (!r.ok) throw new Error(`Azure TTS ${r.status}: ${(await r.text()).slice(0, 160)}`);
+    return await r.blob();
+  }
+  throw new Error('不明な音声エンジン');
+}
+function playBlob(blob) {
+  return new Promise(resolve => {
+    const url = URL.createObjectURL(blob);
+    let done = false; const fin = () => { if (done) return; done = true; S.speaking = false; URL.revokeObjectURL(url); resolve(); };
+    audioEl.onplaying = () => { S.speaking = true; };
+    audioEl.onended = fin; audioEl.onerror = fin;
+    audioEl.src = url;
+    audioEl.play().catch(e => { caption('音声を再生できません（画面を一度タップしてから試してください）', 'err', 6000); fin(); });
+  });
+}
+async function speak(text) {
+  if (!text) return;
+  if (cfg.ttsEngine && cfg.ttsEngine !== 'ios') {
+    stopListening();
+    try { const blob = await synthCloud(text); await playBlob(blob); return; }
+    catch (e) { console.warn(e); caption(`${e.message}（内蔵音声で読みます）`, 'err', 6000); log('TTS: ' + e.message); }
+  }
+  return speakBuiltin(text);
+}
+function speakBuiltin(text) {
   return new Promise(async resolve => {
     if (!('speechSynthesis' in window) || !text) return resolve();
     stopListening();
@@ -614,7 +683,10 @@ function speak(text) {
     setTimeout(fin, 1500 + text.length * 400);   // 保険
   });
 }
-function unlockAudio() { try { const u = new SpeechSynthesisUtterance(''); u.volume = 0; speechSynthesis.speak(u); } catch {} }
+function unlockAudio() {   // iOS は最初の操作の中で一度鳴らしておかないと、あとから自動再生できない
+  try { const u = new SpeechSynthesisUtterance(''); u.volume = 0; speechSynthesis.speak(u); } catch {}
+  try { audioEl.src = SILENT_WAV; audioEl.play().catch(() => {}); } catch {}
+}
 
 /* ========= 音声認識 ========= */
 const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -787,7 +859,7 @@ $('#btnStart').addEventListener('click', async () => {
 $('#btnTouchOnly').addEventListener('click', () => { $('#start').hidden = true; keepAwake(); unlockAudio(); S.touchUntil = performance.now() + 1500; setExpr('curious', 1500); });
 
 /* ========= コントロール・設定 ========= */
-btnTalk.addEventListener('click', () => { if (S.listening) stopListening(); else if (!S.busy) startListening(); });
+btnTalk.addEventListener('click', () => { unlockAudio(); if (S.listening) stopListening(); else if (!S.busy) startListening(); });
 $('#btnKbd').addEventListener('click', () => { const r = $('#textRow'); r.hidden = !r.hidden; if (!r.hidden) $('#txt').focus(); });
 function sendText() { const t = $('#txt').value.trim(); if (!t) return; $('#txt').value = ''; converse(t); }
 $('#btnSend').addEventListener('click', sendText);
@@ -800,12 +872,14 @@ $('#btnClose').addEventListener('click', () => { sheet.hidden = true; });
 sheet.addEventListener('click', e => { if (e.target === sheet) sheet.hidden = true; });
 $('#btnClearHist').addEventListener('click', () => { history = []; $('#testResult').textContent = '会話履歴を消しました'; $('#testResult').className = ''; });
 $('#btnPreview').addEventListener('click', async () => {
-  const v = pickVoice();
+  unlockAudio();
   const samples = [`こんにちは、${cfg.name}です。今日はいい天気ですね。`, `おっ、来てくれたんだ。何して遊ぶ？`, `ふむふむ、それは面白いね。もっと聞かせて。`];
-  caption(`試聴: ${v ? v.name : '（日本語の声が見つかりません）'}`, 'heard', 4000);
+  const who = cfg.ttsEngine === 'google' ? `Google ${cfg.googleVoice}` : cfg.ttsEngine === 'openai' ? `OpenAI ${cfg.openaiVoice}` : cfg.ttsEngine === 'azure' ? `Azure ${cfg.azureVoice}` : (pickVoice()?.name || '（日本語の声が見つかりません）');
+  caption(`試聴: ${who}`, 'heard', 4000);
   setExpr('happy', 4000);
   await speak(samples[Math.floor(Math.random() * samples.length)]);
 });
+function showTtsFields() { for (const k of ['ios', 'google', 'openai', 'azure']) document.querySelectorAll('.tts-' + k).forEach(el => { el.hidden = cfg.ttsEngine !== k; }); }
 $('#btnTest').addEventListener('click', async () => {
   const out = $('#testResult'); out.className = ''; out.textContent = '接続中…';
   try {
@@ -820,9 +894,11 @@ document.querySelectorAll('[data-cfg]').forEach(el => {
     cfg[k] = isBool ? el.checked : el.type === 'range' ? parseFloat(el.value) : el.value;
     saveCfg();
     if (k === 'debug') $('#debug').hidden = !cfg.debug;
+    if (k === 'ttsEngine') showTtsFields();
   });
 });
 $('#debug').hidden = !cfg.debug;
+showTtsFields();
 
 /* 外部連携・動作確認用: window.gazeEyes.setExpr('happy') / .say('こんにちは') */
 window.gazeEyes = { setExpr, say: t => speak(t), converse, state: S, cfg };
