@@ -158,6 +158,7 @@
     <label class="field"><span>見たものを伝える<small>話しかけるたびにカメラ画像を1枚 Claude に送ります</small></span><span class="switch"><input type="checkbox" id="sendImage" data-cfg="sendImage"><i></i></span></label>
     <label class="field"><span>目が合ったら話しかける<small>しばらく会話がないときだけ</small></span><span class="switch"><input type="checkbox" id="greet" data-cfg="greet"><i></i></span></label>
     <label class="field"><span>返事のあと続けて聞く</span><span class="switch"><input type="checkbox" id="continuous" data-cfg="continuous"><i></i></span></label>
+    <label class="field"><span>読み上げを工夫する<small>Claude にふりがな付きの読みを作らせ、文ごとに間と抑揚を付ける（内蔵音声のみ）。オフで従来どおり</small></span><span class="switch"><input type="checkbox" id="smartRead" data-cfg="smartRead"><i></i></span></label>
     <label class="field col"><span>音声エンジン<small>iPhone 内蔵は標準版の声しか使えません。自然な声はクラウドのどれかを選び、そのキーだけ入力</small></span><select id="ttsEngine" data-cfg="ttsEngine"><option value="ios">iPhone 内蔵</option><option value="google">Google Cloud TTS</option><option value="openai">OpenAI TTS</option><option value="azure">Azure Speech</option></select></label>
     <label class="field tts-ios"><span>声（内蔵）</span><select id="voiceKey" data-cfg="voiceKey"><option value="">自動（日本語）</option></select></label>
     <label class="field tts-google"><span>Google APIキー</span><input type="password" id="googleKey" data-cfg="googleKey" autocomplete="off" placeholder="AIza…"></label>
@@ -228,7 +229,7 @@ const DEFAULTS = {
   persona: '好奇心旺盛で、ちょっといたずら好き。相手のことを知りたがる。難しい話も身近なたとえで短く返す。語尾はやわらかく、たまに「ふむふむ」「おっ」などの相づちを入れる。',
   ttsEngine: 'ios', voiceKey: '', rate: 1.0, pitch: 1.0,
   googleKey: '', googleVoice: 'ja-JP-Neural2-B', openaiKey: '', openaiVoice: 'nova', azureKey: '', azureRegion: 'japaneast', azureVoice: 'ja-JP-NanamiNeural',
-  sendImage: true, greet: true, continuous: false,
+  sendImage: true, greet: true, continuous: false, smartRead: true,
   follow: 'gaze', invX: false, invY: false, gain: 2.2, upBias: 0.12, blinkSync: true,
   eyeColor: 'aqua', debug: false,
 };
@@ -658,30 +659,73 @@ function playBlob(blob) {
     audioEl.play().catch(e => { caption('音声を再生できません（画面を一度タップしてから試してください）', 'err', 6000); fin(); });
   });
 }
-async function speak(text) {
-  if (!text) return;
+/* say = 画面用の文（漢字あり）, read = Claude が作った読み上げ用の文（内蔵音声向け）。クラウド音声は漢字文のほうが上手に読む */
+async function speak(say, read, emotion = 'neutral') {
+  if (!say) return;
   if (cfg.ttsEngine && cfg.ttsEngine !== 'ios') {
     stopListening();
-    try { const blob = await synthCloud(text); await playBlob(blob); return; }
+    try { const blob = await synthCloud(say); await playBlob(blob); return; }
     catch (e) { console.warn(e); caption(`${e.message}（内蔵音声で読みます）`, 'err', 6000); log('TTS: ' + e.message); }
   }
-  return speakBuiltin(text);
+  return speakBuiltin(cfg.smartRead && read ? read : say, emotion);
 }
-function speakBuiltin(text) {
-  return new Promise(async resolve => {
-    if (!('speechSynthesis' in window) || !text) return resolve();
-    stopListening();
-    if (speechSynthesis.speaking || speechSynthesis.pending) { speechSynthesis.cancel(); await new Promise(r => setTimeout(r, 80)); }  // iOS: cancel 直後の speak は落ちることがある
-    const u = new SpeechSynthesisUtterance(text);
-    u.lang = 'ja-JP'; const v = pickVoice(); if (v) u.voice = v;
-    u.rate = cfg.rate; u.pitch = cfg.pitch;
-    let done = false; const fin = () => { if (done) return; done = true; S.speaking = false; resolve(); };
-    u.onstart = () => { S.speaking = true; };
-    u.onend = fin; u.onerror = fin;
-    currentUtter = u;                       // iOS で途中で消えないよう参照を保持
-    speechSynthesis.speak(u);
-    setTimeout(fin, 1500 + text.length * 400);   // 保険
-  });
+
+/* --- 内蔵音声を少しでも自然に: 記号の整理 → 文ごとに分割 → 文末・感情で速さと高さを微調整 → 文の間に短い間 --- */
+function normalizeForTTS(s) {
+  return s
+    .replace(/[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{FE0F}\u{200D}]/gu, '')   // 絵文字（iOS は絵文字の名前を読み上げてしまう）
+    .replace(/[♪♡♥☆★※]/g, '')
+    .replace(/（笑）|\(笑\)|w+$/g, '')
+    .replace(/…+|\.{3,}|・・・/g, '、')
+    .replace(/[〜～]/g, 'ー')
+    .replace(/!/g, '！').replace(/\?/g, '？')
+    .replace(/、{2,}/g, '、').replace(/^、|、$/g, '')
+    .trim();
+}
+function splitSentences(s) {
+  return (s.match(/[^。！？]+[。！？]*/g) || [s]).map(p => p.trim()).filter(Boolean);
+}
+function prosody(sentence, emotion) {
+  const e = { happy: [.04, .04], excited: [.08, .07], curious: [.02, .05], surprised: [.04, .08], sad: [-.1, -.08], sleepy: [-.15, -.1], thinking: [-.06, -.02], annoyed: [-.02, -.05] }[emotion] || [0, 0];
+  let rate = cfg.rate + e[0], pitch = cfg.pitch + e[1], pause = 180;
+  if (/？$/.test(sentence)) { pitch += .07; rate -= .03; pause = 260; }       // 疑問文は少し高く、ゆっくり
+  else if (/！$/.test(sentence)) { pitch += .04; rate += .05; pause = 220; }  // 感嘆は少し速く
+  if (sentence.length <= 6) pause += 80;                                      // 「ふむふむ。」など短い相づちの後は間を長めに
+  return { rate: clamp(rate, 0.6, 1.6), pitch: clamp(pitch, 0.5, 1.8), pause };
+}
+let speakToken = 0;
+function cancelSpeech() {   // 文の連鎖ごと止める（cancel だけだと次の文が始まってしまう）
+  speakToken++;
+  if ('speechSynthesis' in window && (speechSynthesis.speaking || speechSynthesis.pending)) speechSynthesis.cancel();
+  S.speaking = false;
+}
+async function speakBuiltin(text, emotion = 'neutral') {
+  if (!('speechSynthesis' in window) || !text) return;
+  stopListening();
+  const wasSpeaking = speechSynthesis.speaking || speechSynthesis.pending;
+  cancelSpeech();
+  if (wasSpeaking) await new Promise(r => setTimeout(r, 80));   // iOS: cancel 直後の speak は落ちることがある
+  const token = speakToken;
+  const clean = normalizeForTTS(text);
+  const parts = cfg.smartRead ? splitSentences(clean) : [clean];
+  const v = pickVoice();
+  S.speaking = true;
+  for (let i = 0; i < parts.length && token === speakToken; i++) {
+    const sentence = parts[i];
+    const pr = cfg.smartRead ? prosody(sentence, emotion) : { rate: cfg.rate, pitch: cfg.pitch, pause: 0 };
+    await new Promise(res => {
+      const u = new SpeechSynthesisUtterance(sentence);
+      u.lang = 'ja-JP'; if (v) u.voice = v;
+      u.rate = pr.rate; u.pitch = pr.pitch;
+      let done = false; const fin = () => { if (done) return; done = true; res(); };
+      u.onend = fin; u.onerror = fin;
+      currentUtter = u;                       // iOS で途中で消えないよう参照を保持
+      speechSynthesis.speak(u);
+      setTimeout(fin, 1500 + sentence.length * 400);   // 保険
+    });
+    if (pr.pause && i < parts.length - 1 && token === speakToken) await new Promise(r => setTimeout(r, pr.pause));
+  }
+  if (token === speakToken) S.speaking = false;
 }
 function unlockAudio() {   // iOS は最初の操作の中で一度鳴らしておかないと、あとから自動再生できない
   try { const u = new SpeechSynthesisUtterance(''); u.volume = 0; speechSynthesis.speak(u); } catch {}
@@ -694,8 +738,7 @@ let rec = null;
 function startListening() {
   if (S.busy || S.listening) return;
   if (!SR) { caption('この端末では音声認識が使えません。「文字」で入力してください', 'err'); $('#textRow').hidden = false; return; }
-  if (speechSynthesis.speaking || speechSynthesis.pending) speechSynthesis.cancel();
-  S.speaking = false;
+  cancelSpeech();
   rec = new SR(); rec.lang = 'ja-JP'; rec.interimResults = true; rec.continuous = false; rec.maxAlternatives = 1;
   let text = '', final = '';
   rec.onresult = e => {
@@ -727,7 +770,9 @@ function systemPrompt() {
 - 画像が付いていたら、それはあなたの目（カメラ）に今見えている光景。聞かれたときや面白いものがあるときだけ、さりげなく触れる。
 - 「(システム: …)」で始まるメッセージは、相手の発言ではなくあなたへの合図。
 - 返答は必ず次の JSON だけを返す。前後に文章や \`\`\` を付けない:
-{"say":"話す内容","emotion":"${EMOTIONS.join('|')}"}`;
+{"say":"画面に表示する文","read":"say を音声合成に読ませるための文","emotion":"${EMOTIONS.join('|')}"}
+- read の書き方: say と同じ内容・同じ語順で、読み間違えやすい漢字・人名・地名・数字・単位・英字を、ひらがな（英語はカタカナ）に直す。よく使う簡単な漢字はそのまま残す。息つぎの位置に「、」を入れる。絵文字・記号・顔文字は入れない。
+  例: {"say":"今日は11月2日だよ。Claudeと話せて嬉しい！","read":"きょうは、じゅういちがつふつかだよ。クロードと話せて、うれしい！","emotion":"happy"}`;
 }
 function situation() {
   const t = new Date(); const hm = `${t.getHours()}:${String(t.getMinutes()).padStart(2, '0')}`;
@@ -747,6 +792,7 @@ function parseReply(text) {
   if (!o) { const m = text.match(/\{[\s\S]*\}/); if (m) o = tryParse(m[0]); }
   if (!o) o = { say: text.replace(/```[a-z]*|```/g, '').trim().slice(0, 120), emotion: 'neutral' };
   if (!EMOTIONS.includes(o.emotion)) o.emotion = 'neutral';
+  if (typeof o.read !== 'string' || !o.read.trim()) o.read = o.say;
   return o;
 }
 async function callClaude(messages, { maxTokens = 300, system = systemPrompt() } = {}) {
@@ -775,7 +821,7 @@ async function askClaude(userText) {
   const messages = history.map((m, i) => i === history.length - 1 ? m : { role: m.role, content: Array.isArray(m.content) ? m.content.filter(c => c.type !== 'image') : m.content });
   const text = await callClaude(messages);
   const reply = parseReply(text);
-  history.push({ role: 'assistant', content: JSON.stringify({ say: reply.say, emotion: reply.emotion }) });
+  history.push({ role: 'assistant', content: JSON.stringify({ say: reply.say, read: reply.read, emotion: reply.emotion }) });
   return reply;
 }
 async function converse(text, kind = 'user') {
@@ -790,7 +836,8 @@ async function converse(text, kind = 'user') {
     setExpr(reply.emotion, 9000);
     caption(reply.say, 'say', 12000);
     log(`${reply.emotion}: ${reply.say}`);
-    await speak(reply.say);
+    if (cfg.debug && reply.read !== reply.say) log(`読み: ${reply.read}`);
+    await speak(reply.say, reply.read, reply.emotion);
     S.lastTalkAt = performance.now();
     S.busy = false; btnTalk.classList.remove('busy'); talkLabel.textContent = '話す';
     if (cfg.continuous && kind === 'user') startListening();
@@ -873,11 +920,16 @@ sheet.addEventListener('click', e => { if (e.target === sheet) sheet.hidden = tr
 $('#btnClearHist').addEventListener('click', () => { history = []; $('#testResult').textContent = '会話履歴を消しました'; $('#testResult').className = ''; });
 $('#btnPreview').addEventListener('click', async () => {
   unlockAudio();
-  const samples = [`こんにちは、${cfg.name}です。今日はいい天気ですね。`, `おっ、来てくれたんだ。何して遊ぶ？`, `ふむふむ、それは面白いね。もっと聞かせて。`];
+  const samples = [
+    { say: `こんにちは、${cfg.name}です。今日はいい天気ですね。`, read: `こんにちは、${cfg.name}です。きょうは、いい天気ですね。`, emotion: 'happy' },
+    { say: `おっ、来てくれたんだ！何して遊ぶ？`, read: `おっ、来てくれたんだ！なにして遊ぶ？`, emotion: 'excited' },
+    { say: `ふむふむ。それは面白いね。もっと聞かせて！`, read: `ふむふむ。それは、おもしろいね。もっと聞かせて！`, emotion: 'curious' },
+  ];
   const who = cfg.ttsEngine === 'google' ? `Google ${cfg.googleVoice}` : cfg.ttsEngine === 'openai' ? `OpenAI ${cfg.openaiVoice}` : cfg.ttsEngine === 'azure' ? `Azure ${cfg.azureVoice}` : (pickVoice()?.name || '（日本語の声が見つかりません）');
-  caption(`試聴: ${who}`, 'heard', 4000);
-  setExpr('happy', 4000);
-  await speak(samples[Math.floor(Math.random() * samples.length)]);
+  const s = samples[Math.floor(Math.random() * samples.length)];
+  caption(`試聴: ${who}${cfg.smartRead ? '（工夫あり）' : '（工夫なし）'}`, 'heard', 4000);
+  setExpr(s.emotion, 4000);
+  await speak(s.say, s.read, s.emotion);
 });
 function showTtsFields() { for (const k of ['ios', 'google', 'openai', 'azure']) document.querySelectorAll('.tts-' + k).forEach(el => { el.hidden = cfg.ttsEngine !== k; }); }
 $('#btnTest').addEventListener('click', async () => {
@@ -901,7 +953,7 @@ $('#debug').hidden = !cfg.debug;
 showTtsFields();
 
 /* 外部連携・動作確認用: window.gazeEyes.setExpr('happy') / .say('こんにちは') */
-window.gazeEyes = { setExpr, say: t => speak(t), converse, state: S, cfg };
+window.gazeEyes = { setExpr, say: (t, r, e) => speak(t, r, e), converse, state: S, cfg, _tts: { normalizeForTTS, splitSentences, prosody } };
 
 resize();
 S.nextBlink = performance.now() + 1500;
