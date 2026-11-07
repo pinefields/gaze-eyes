@@ -46,7 +46,8 @@
   #status .fps { font-family: var(--mono); font-size: 11px; color: var(--muted); }
 
   /* 字幕 */
-  #caption { position: fixed; left: 50%; bottom: calc(max(12px, env(safe-area-inset-bottom)) + 96px); transform: translateX(-50%); max-width: min(34em, calc(100vw - 32px)); padding: 10px 16px; border-radius: 16px; background: rgba(20,26,43,.88); backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); font-size: 15px; line-height: 1.6; text-align: center; transition: opacity .4s; pointer-events: none; z-index: 2; }
+  #caption { position: fixed; left: 50%; bottom: calc(max(12px, env(safe-area-inset-bottom)) + 108px); transform: translateX(-50%); max-width: min(34em, calc(100vw - 32px)); max-height: 38vh; overflow: hidden; padding: 10px 16px; border-radius: 16px; background: rgba(20,26,43,.88); backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); font-size: 15px; line-height: 1.6; text-align: center; white-space: pre-wrap; transition: opacity .4s, bottom .2s; pointer-events: none; z-index: 3; }
+  body.kbd #caption { bottom: calc(max(12px, env(safe-area-inset-bottom)) + 166px); }
   #caption.hide { opacity: 0; }
   #caption.heard { color: var(--muted); }
   #caption.say { color: var(--fg); border: 1px solid rgba(63,200,189,.35); }
@@ -763,7 +764,7 @@ let discardListening = false;   // 文字入力に切り替えたときなど、
 function startListening() {
   if (S.listening) return;
   if (S.busy) { caption('返事の途中です。少し待ってください', 'heard', 1500); return; }
-  if (!SR) { caption('この端末では音声認識が使えません。「文字」で入力してください', 'err'); $('#textRow').hidden = false; return; }
+  if (!SR) { caption('この端末では音声認識が使えません。「文字」で入力してください', 'err'); $('#textRow').hidden = false; document.body.classList.add('kbd'); return; }
   cancelSpeech();
   rec = new SR(); rec.lang = 'ja-JP'; rec.interimResults = true; rec.continuous = false; rec.maxAlternatives = 1;
   let text = '', final = '';
@@ -816,17 +817,25 @@ function snapshot() {
   return snapCanvas.toDataURL('image/jpeg', 0.6).split(',')[1];
 }
 function parseReply(text) {
+  const clean = text.replace(/```[a-z]*\n?|```/g, '').trim();
   const tryParse = s => { try { const o = JSON.parse(s); if (o && typeof o.say === 'string') return o; } catch {} return null; };
-  let o = tryParse(text.trim());
-  if (!o) { const m = text.match(/\{[\s\S]*\}/); if (m) o = tryParse(m[0]); }
-  if (!o) o = { say: text.replace(/```[a-z]*|```/g, '').trim().slice(0, 120), emotion: 'neutral' };
+  let o = tryParse(clean);
+  if (!o) { const m = clean.match(/\{[\s\S]*\}/); if (m) o = tryParse(m[0]); }
+  if (!o) {   // 途中で切れた JSON や、余計な文が混ざった返事から、項目だけ拾う
+    const unesc = s => s.replace(/\\"/g, '"').replace(/\\n/g, ' ').replace(/\\\\/g, '\\');
+    const field = k => { const m = clean.match(new RegExp(`"${k}"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)"`)); return m ? unesc(m[1]) : null; };
+    const partial = k => { const m = clean.match(new RegExp(`"${k}"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)$`)); return m ? unesc(m[1]) : null; };
+    const say = field('say') || partial('say');
+    if (say) { o = { say, read: field('read'), emotion: field('emotion') || 'neutral' }; log('JSON を解釈できず、項目だけ復元'); }
+    else o = { say: clean.replace(/^\{|\}$/g, '').slice(0, 120), emotion: 'neutral' };
+  }
   if (!EMOTIONS.includes(o.emotion)) o.emotion = 'neutral';
   if (typeof o.read !== 'string' || !o.read.trim()) o.read = o.say;
   return o;
 }
 let currentAbort = null;
 const FALLBACK_MODEL = 'claude-sonnet-5-5';   // Haiku が返答を控えたときに、1回だけ別モデルで試す
-async function callClaude(messages, { maxTokens = 300, system = systemPrompt(), signal, model = cfg.model || DEFAULTS.model, raw = false } = {}) {
+async function callClaude(messages, { maxTokens = 700, system = systemPrompt(), signal, model = cfg.model || DEFAULTS.model, raw = false } = {}) {
   const ac = new AbortController(); currentAbort = ac;
   const timer = setTimeout(() => ac.abort('timeout'), 45000);
   if (signal) signal.addEventListener('abort', () => ac.abort(signal.reason));
@@ -999,7 +1008,7 @@ $('#btnTouchOnly').addEventListener('click', () => { $('#start').hidden = true; 
 
 /* ========= コントロール・設定 ========= */
 btnTalk.addEventListener('click', () => { unlockAudio(); if (S.listening) stopListening(); else startListening(); });
-$('#btnKbd').addEventListener('click', () => { const r = $('#textRow'); r.hidden = !r.hidden; if (!r.hidden) $('#txt').focus(); });
+$('#btnKbd').addEventListener('click', () => { const r = $('#textRow'); r.hidden = !r.hidden; document.body.classList.toggle('kbd', !r.hidden); if (!r.hidden) $('#txt').focus(); });
 function sendText() { const t = $('#txt').value.trim(); if (!t) return; $('#txt').value = ''; unlockAudio(); if (S.listening) stopListening(true); converse(t); }
 $('#btnSend').addEventListener('click', sendText);
 $('#txt').addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); sendText(); } });
