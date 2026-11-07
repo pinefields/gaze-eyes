@@ -825,7 +825,8 @@ function parseReply(text) {
   return o;
 }
 let currentAbort = null;
-async function callClaude(messages, { maxTokens = 300, system = systemPrompt(), signal } = {}) {
+const FALLBACK_MODEL = 'claude-sonnet-5-5';   // Haiku が返答を控えたときに、1回だけ別モデルで試す
+async function callClaude(messages, { maxTokens = 300, system = systemPrompt(), signal, model = cfg.model || DEFAULTS.model, raw = false } = {}) {
   const ac = new AbortController(); currentAbort = ac;
   const timer = setTimeout(() => ac.abort('timeout'), 45000);
   if (signal) signal.addEventListener('abort', () => ac.abort(signal.reason));
@@ -835,7 +836,7 @@ async function callClaude(messages, { maxTokens = 300, system = systemPrompt(), 
     r = await fetch(API_URL, {
       method: 'POST', signal: ac.signal,
       headers: { 'x-api-key': cfg.apiKey, 'anthropic-version': '2023-06-01', 'content-type': 'application/json', 'anthropic-dangerous-direct-browser-access': 'true' },
-      body: JSON.stringify({ model: cfg.model || DEFAULTS.model, max_tokens: maxTokens, system, messages }),
+      body: JSON.stringify({ model, max_tokens: maxTokens, system, messages }),
     });
   } catch (e) {
     clearTimeout(timer);
@@ -853,8 +854,11 @@ async function callClaude(messages, { maxTokens = 300, system = systemPrompt(), 
   }
   const data = await r.json();
   const text = (data.content || []).filter(c => c.type === 'text').map(c => c.text).join('');
-  log(`API OK ${ms}ms ${text.length}文字 stop=${data.stop_reason || '?'}`);
-  if (!text.trim()) throw new Error('Claude の返事が空でした');
+  const types = (data.content || []).map(c => c.type).join('+') || 'なし';
+  const details = data.stop_details ? ' ' + JSON.stringify(data.stop_details).slice(0, 80) : '';
+  log(`API OK ${ms}ms ${model.replace('claude-', '')} ${text.length}文字 blocks=${types} stop=${data.stop_reason || '?'}${details}`);
+  if (raw) return { text, stop: data.stop_reason, details: data.stop_details };
+  if (!text.trim()) throw new Error(data.stop_reason === 'refusal' ? 'Claude が返答を控えました' : 'Claude の返事が空でした');
   return text;
 }
 /* 連続する同じ役割の発言をまとめる（失敗で途切れた会話でも API が受け付ける形にする） */
@@ -879,8 +883,22 @@ async function askClaude(userText, signal) {
   // 画像は最新の発言にだけ残す（トークン節約）
   const messages = msgs.map((m, i) => i === msgs.length - 1 ? m : { role: m.role, content: m.content.filter(c => c.type !== 'image') });
   let text;
-  try { text = await callClaude(messages, { signal }); }
-  catch (e) { history.pop(); throw e; }          // 失敗した発言は履歴から外す
+  try {
+    let res = await callClaude(messages, { signal, raw: true });
+    if (!res.text.trim() && img) {                  // 空 or 拒否 → まず画像を外して同じ質問をやり直す
+      log('返事が空。画像なしで再試行');
+      const noImg = messages.map(m => ({ role: m.role, content: m.content.filter(c => c.type !== 'image') }));
+      res = await callClaude(noImg, { signal, raw: true });
+      if (res.text.trim()) { content.splice(content.findIndex(c => c.type === 'image'), 1); S.imageRefusals = (S.imageRefusals || 0) + 1; }
+    }
+    if (!res.text.trim() && (cfg.model || DEFAULTS.model) !== FALLBACK_MODEL) {   // それでも空 → 別モデルで1回
+      log(`返事が空。${FALLBACK_MODEL} で再試行`);
+      const noImg = messages.map(m => ({ role: m.role, content: m.content.filter(c => c.type !== 'image') }));
+      res = await callClaude(noImg, { signal, raw: true, model: FALLBACK_MODEL });
+    }
+    if (!res.text.trim()) throw new Error(res.stop === 'refusal' ? `Claude が返答を控えました${res.details?.category ? '（' + res.details.category + '）' : ''}。別の聞き方を試してください` : 'Claude の返事が空でした');
+    text = res.text;
+  } catch (e) { history.pop(); throw e; }          // 失敗した発言は履歴から外す
   const reply = parseReply(text);
   if (!reply.say.trim()) { history.pop(); log(`解釈できない返事: ${text.slice(0, 80)}`); throw new Error('返事を解釈できませんでした'); }
   history.push({ role: 'assistant', content: JSON.stringify({ say: reply.say, read: reply.read, emotion: reply.emotion }) });
