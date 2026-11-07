@@ -180,6 +180,10 @@
     <label class="field"><span>上下反転<small>カメラが逆向きの環境用</small></span><span class="switch"><input type="checkbox" id="invY" data-cfg="invY"><i></i></span></label>
     <label class="field"><span>左右反転</span><span class="switch"><input type="checkbox" id="invX" data-cfg="invX"><i></i></span></label>
     <label class="field"><span>デバッグ表示</span><span class="switch"><input type="checkbox" id="debugSw" data-cfg="debug"><i></i></span></label>
+    <h3>ログ・診断</h3>
+    <div id="diag" style="font-size:12px;color:var(--muted);line-height:1.7"></div>
+    <div class="btnrow"><button id="btnSpeakTest">音声テスト</button><button id="btnCopyLog">ログをコピー</button><button id="btnClearLog">ログを消す</button></div>
+    <pre id="fullLog" style="font-family:var(--mono);font-size:11px;line-height:1.5;white-space:pre-wrap;word-break:break-all;background:var(--bg-soft);padding:8px 10px;border-radius:10px;max-height:14em;overflow-y:auto;margin:8px 0 0;-webkit-user-select:text;user-select:text">（まだ何もありません）</pre>
     <p style="font-size:12px;color:var(--muted);line-height:1.6;margin:12px 0 0">画面をダブルタップすると表情を順に試せます。ドラッグで目を動かせます。</p>
   </div>
 </div>
@@ -216,10 +220,14 @@ const store = {
   get(k, d) { try { const v = localStorage.getItem('gaze.' + k); return v === null ? d : JSON.parse(v); } catch { return d; } },
   set(k, v) { try { localStorage.setItem('gaze.' + k, JSON.stringify(v)); } catch {} },
 };
+const LOGS = [];
 function log(msg) {
   const t = new Date().toTimeString().slice(0, 8);
-  const d = document.createElement('div'); d.className = 'ev'; d.textContent = `${t} ${msg}`;
+  const line = `${t} ${msg}`;
+  LOGS.push(line); if (LOGS.length > 40) LOGS.shift();
+  const d = document.createElement('div'); d.className = 'ev'; d.textContent = line;
   logEl.prepend(d); while (logEl.children.length > 4) logEl.lastChild.remove();
+  const full = document.getElementById('fullLog'); if (full) { full.textContent = LOGS.slice().reverse().join('\n'); }
 }
 function emit(type, extra = {}) { window.dispatchEvent(new CustomEvent('gaze', { detail: { type, at: Date.now(), ...extra } })); }
 
@@ -262,7 +270,7 @@ const S = {
   expr: 'neutral', exprUntil: 0,                   // 一時的な表情
   override: null,                                  // 視線の強制（考え中など）
   listening: false, thinking: false, speaking: false, busy: false,
-  lastTalkAt: -1e9, lastGreetAt: -1e9,
+  lastTalkAt: -1e9, lastGreetAt: -1e9, startedAt: 1e12, lastSpeechError: '',
   vals: null, detCount: 0, detFps: 0, detFpsAt: 0,
   stretchX: 1, stretchY: 1, prevPos: null,
 };
@@ -664,7 +672,7 @@ async function speak(say, read, emotion = 'neutral') {
   if (!say) return;
   if (cfg.ttsEngine && cfg.ttsEngine !== 'ios') {
     stopListening();
-    try { const blob = await synthCloud(say); await playBlob(blob); return; }
+    try { const blob = await synthCloud(say); await playBlob(blob); return true; }
     catch (e) { console.warn(e); caption(`${e.message}（内蔵音声で読みます）`, 'err', 6000); log('TTS: ' + e.message); }
   }
   return speakBuiltin(cfg.smartRead && read ? read : say, emotion);
@@ -699,64 +707,85 @@ function cancelSpeech() {   // 文の連鎖ごと止める（cancel だけだと
   if ('speechSynthesis' in window && (speechSynthesis.speaking || speechSynthesis.pending)) speechSynthesis.cancel();
   S.speaking = false;
 }
+/* 1文を話す。結果: 'ok' = 音が出た / 'silent' = 始まらずに終わった（iOS の再生制限など）/ 'timeout' */
+function speakOne(sentence, v, pr) {
+  return new Promise(res => {
+    const u = new SpeechSynthesisUtterance(sentence);
+    u.lang = 'ja-JP'; if (v) u.voice = v;
+    u.rate = pr.rate; u.pitch = pr.pitch;
+    let started = false, done = false; const t0 = performance.now();
+    const fin = why => { if (done) return; done = true; res(started ? 'ok' : why); };
+    u.onstart = () => { started = true; };
+    u.onend = () => fin(performance.now() - t0 < 300 ? 'silent' : 'ok');
+    u.onerror = e => { if (e.error !== 'interrupted' && e.error !== 'canceled') S.lastSpeechError = e.error; fin(e.error === 'interrupted' || e.error === 'canceled' ? 'ok' : 'silent'); };
+    currentUtter = u;                       // iOS で途中で消えないよう参照を保持
+    try { speechSynthesis.speak(u); } catch (e) { S.lastSpeechError = e.message; fin('silent'); }
+    setTimeout(() => fin('timeout'), 1500 + sentence.length * 400);   // 保険
+  });
+}
 async function speakBuiltin(text, emotion = 'neutral') {
   if (!('speechSynthesis' in window) || !text) return;
   stopListening();
   const wasSpeaking = speechSynthesis.speaking || speechSynthesis.pending;
   cancelSpeech();
-  if (wasSpeaking) await new Promise(r => setTimeout(r, 80));   // iOS: cancel 直後の speak は落ちることがある
+  if (wasSpeaking) await new Promise(r => setTimeout(r, 150));   // iOS: cancel 直後の speak は落ちることがある
   const token = speakToken;
   const clean = normalizeForTTS(text);
   const parts = cfg.smartRead ? splitSentences(clean) : [clean];
-  const v = pickVoice();
-  S.speaking = true;
+  let v = pickVoice();
+  S.speaking = true; S.lastSpeechError = '';
+  let spoke = false;
   for (let i = 0; i < parts.length && token === speakToken; i++) {
     const sentence = parts[i];
     const pr = cfg.smartRead ? prosody(sentence, emotion) : { rate: cfg.rate, pitch: cfg.pitch, pause: 0 };
-    await new Promise(res => {
-      const u = new SpeechSynthesisUtterance(sentence);
-      u.lang = 'ja-JP'; if (v) u.voice = v;
-      u.rate = pr.rate; u.pitch = pr.pitch;
-      let done = false; const fin = () => { if (done) return; done = true; res(); };
-      u.onend = fin; u.onerror = fin;
-      currentUtter = u;                       // iOS で途中で消えないよう参照を保持
-      speechSynthesis.speak(u);
-      setTimeout(fin, 1500 + sentence.length * 400);   // 保険
-    });
-    if (pr.pause && i < parts.length - 1 && token === speakToken) await new Promise(r => setTimeout(r, pr.pause));
+    let r = await speakOne(sentence, v, pr);
+    if (r === 'silent' && token === speakToken) {           // 一度だけやり直す: 少し待って、声の指定なし・標準の速さで
+      await new Promise(w => setTimeout(w, 250));
+      r = await speakOne(sentence, null, { rate: 1, pitch: 1 });
+      if (r === 'ok') v = null;
+    }
+    if (r === 'ok') spoke = true;
+    else { log(`音声: ${r}${S.lastSpeechError ? ' (' + S.lastSpeechError + ')' : ''} 「${sentence.slice(0, 12)}…」`); if (r === 'silent') break; }
+    if (pr.pause && i < parts.length - 1 && token === speakToken) await new Promise(w => setTimeout(w, pr.pause));
   }
   if (token === speakToken) S.speaking = false;
+  return spoke;
 }
 function unlockAudio() {   // iOS は最初の操作の中で一度鳴らしておかないと、あとから自動再生できない
-  try { const u = new SpeechSynthesisUtterance(''); u.volume = 0; speechSynthesis.speak(u); } catch {}
+  try { if (!(speechSynthesis.speaking || speechSynthesis.pending)) { const u = new SpeechSynthesisUtterance('あ'); u.volume = 0; u.rate = 2; speechSynthesis.speak(u); } } catch {}
   try { audioEl.src = SILENT_WAV; audioEl.play().catch(() => {}); } catch {}
 }
 
 /* ========= 音声認識 ========= */
 const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
 let rec = null;
+let discardListening = false;   // 文字入力に切り替えたときなど、聞き取り結果を捨てる
 function startListening() {
-  if (S.busy || S.listening) return;
+  if (S.listening) return;
+  if (S.busy) { caption('返事の途中です。少し待ってください', 'heard', 1500); return; }
   if (!SR) { caption('この端末では音声認識が使えません。「文字」で入力してください', 'err'); $('#textRow').hidden = false; return; }
   cancelSpeech();
   rec = new SR(); rec.lang = 'ja-JP'; rec.interimResults = true; rec.continuous = false; rec.maxAlternatives = 1;
   let text = '', final = '';
+  discardListening = false;
   rec.onresult = e => {
     text = ''; for (let i = 0; i < e.results.length; i++) text += e.results[i][0].transcript;
     if (e.results[e.results.length - 1].isFinal) final = text;
     caption(`「${text}」`, 'heard', 0);
   };
-  rec.onerror = e => { if (e.error !== 'no-speech' && e.error !== 'aborted') caption('音声認識エラー: ' + e.error, 'err'); };
+  rec.onerror = e => { log('音声認識エラー: ' + e.error); if (e.error !== 'no-speech' && e.error !== 'aborted') caption('音声認識エラー: ' + e.error, 'err'); };
   rec.onend = () => {
     S.listening = false; btnTalk.classList.remove('listening'); talkLabel.textContent = '話す';
     if (cam.srcObject && cam.paused) cam.play().catch(() => {});
     const t = (final || text).trim();
+    log(`聞き取り終了: ${t ? '「' + t.slice(0, 20) + '」' : '（なし）'}`);
+    if (discardListening) { discardListening = false; return; }
     if (t) converse(t); else if (!S.busy) capEl.classList.add('hide');
   };
-  try { rec.start(); S.listening = true; btnTalk.classList.add('listening'); talkLabel.textContent = '聞き取り中'; caption('どうぞ…', 'heard', 0); }
-  catch (e) { caption('マイクを開始できません: ' + e.message, 'err'); }
+  try { rec.start(); S.listening = true; btnTalk.classList.add('listening'); talkLabel.textContent = '聞き取り中'; caption('どうぞ…', 'heard', 0); log('聞き取り開始'); }
+  catch (e) { log('マイク開始失敗: ' + e.message); caption('マイクを開始できません: ' + e.message, 'err'); }
 }
-function stopListening() { if (rec && S.listening) { try { rec.stop(); } catch {} } }
+function stopListening(discard = false) { if (rec && S.listening) { if (discard) discardListening = true; try { rec.stop(); } catch {} } }
 
 /* ========= Claude ========= */
 let history = [];
@@ -795,61 +824,106 @@ function parseReply(text) {
   if (typeof o.read !== 'string' || !o.read.trim()) o.read = o.say;
   return o;
 }
-async function callClaude(messages, { maxTokens = 300, system = systemPrompt() } = {}) {
-  const r = await fetch(API_URL, {
-    method: 'POST',
-    headers: { 'x-api-key': cfg.apiKey, 'anthropic-version': '2023-06-01', 'content-type': 'application/json', 'anthropic-dangerous-direct-browser-access': 'true' },
-    body: JSON.stringify({ model: cfg.model || DEFAULTS.model, max_tokens: maxTokens, system, messages }),
-  });
+let currentAbort = null;
+async function callClaude(messages, { maxTokens = 300, system = systemPrompt(), signal } = {}) {
+  const ac = new AbortController(); currentAbort = ac;
+  const timer = setTimeout(() => ac.abort('timeout'), 45000);
+  if (signal) signal.addEventListener('abort', () => ac.abort(signal.reason));
+  const t0 = performance.now();
+  let r;
+  try {
+    r = await fetch(API_URL, {
+      method: 'POST', signal: ac.signal,
+      headers: { 'x-api-key': cfg.apiKey, 'anthropic-version': '2023-06-01', 'content-type': 'application/json', 'anthropic-dangerous-direct-browser-access': 'true' },
+      body: JSON.stringify({ model: cfg.model || DEFAULTS.model, max_tokens: maxTokens, system, messages }),
+    });
+  } catch (e) {
+    clearTimeout(timer);
+    if (ac.signal.aborted) throw new Error(ac.signal.reason === 'timeout' ? 'Claude の応答が45秒以内に来ませんでした' : '中断しました');
+    log(`通信失敗: ${e.message}`); throw new Error('通信できませんでした（オフライン？）');
+  }
+  clearTimeout(timer);
+  const ms = Math.round(performance.now() - t0);
   if (!r.ok) {
     let detail = ''; try { detail = (await r.json()).error?.message || ''; } catch {}
+    log(`API ${r.status} ${ms}ms ${detail.slice(0, 80)}`);
     const msg = r.status === 401 ? 'APIキーが正しくありません' : r.status === 404 || /model/i.test(detail) && r.status === 400 ? `モデル名を確認してください（${cfg.model}）` :
-      r.status === 429 ? '混み合っています。少し待ってください' : r.status >= 500 ? 'Claude 側が混雑中です' : `HTTP ${r.status} ${detail}`;
+      r.status === 429 ? '混み合っています。少し待ってください' : r.status >= 500 ? 'Claude 側が混雑中です' : `HTTP ${r.status} ${detail.slice(0, 120)}`;
     throw new Error(msg);
   }
   const data = await r.json();
-  return data.content.filter(c => c.type === 'text').map(c => c.text).join('');
+  const text = (data.content || []).filter(c => c.type === 'text').map(c => c.text).join('');
+  log(`API OK ${ms}ms ${text.length}文字 stop=${data.stop_reason || '?'}`);
+  if (!text.trim()) throw new Error('Claude の返事が空でした');
+  return text;
 }
-async function askClaude(userText) {
+/* 連続する同じ役割の発言をまとめる（失敗で途切れた会話でも API が受け付ける形にする） */
+function alternatingHistory() {
+  const out = [];
+  for (const m of history) {
+    const content = Array.isArray(m.content) ? m.content : [{ type: 'text', text: m.content }];
+    const last = out[out.length - 1];
+    if (last && last.role === m.role) last.content = last.content.concat(content); else out.push({ role: m.role, content: content.slice() });
+  }
+  while (out.length && out[0].role !== 'user') out.shift();
+  return out;
+}
+async function askClaude(userText, signal) {
   const content = [];
   const img = cfg.sendImage ? snapshot() : null;
   if (img) content.push({ type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: img } });
   content.push({ type: 'text', text: `${situation()}\n${userText}` });
   history.push({ role: 'user', content });
   history = history.slice(-12);
+  const msgs = alternatingHistory();
   // 画像は最新の発言にだけ残す（トークン節約）
-  const messages = history.map((m, i) => i === history.length - 1 ? m : { role: m.role, content: Array.isArray(m.content) ? m.content.filter(c => c.type !== 'image') : m.content });
-  const text = await callClaude(messages);
+  const messages = msgs.map((m, i) => i === msgs.length - 1 ? m : { role: m.role, content: m.content.filter(c => c.type !== 'image') });
+  let text;
+  try { text = await callClaude(messages, { signal }); }
+  catch (e) { history.pop(); throw e; }          // 失敗した発言は履歴から外す
   const reply = parseReply(text);
+  if (!reply.say.trim()) { history.pop(); log(`解釈できない返事: ${text.slice(0, 80)}`); throw new Error('返事を解釈できませんでした'); }
   history.push({ role: 'assistant', content: JSON.stringify({ say: reply.say, read: reply.read, emotion: reply.emotion }) });
   return reply;
 }
+let busyKind = null, pendingText = null;
 async function converse(text, kind = 'user') {
-  if (S.busy) return;
+  if (S.busy) {
+    if (kind !== 'user') return;                                   // 自動の話しかけは、忙しければ見送る
+    if (busyKind === 'event' && currentAbort) { currentAbort.abort('user'); log('話しかけを中断して質問を優先'); }
+    else { pendingText = text; caption(`「${text}」（返事のあとに送ります）`, 'heard', 0); return; }
+    await new Promise(r => setTimeout(r, 50));
+    if (S.busy) { pendingText = text; return; }
+  }
   if (!cfg.apiKey) { caption('設定で Claude の APIキーを入れてください', 'err'); openSheet(); return; }
-  S.busy = true; S.thinking = true; btnTalk.classList.add('busy'); talkLabel.textContent = '考え中';
+  S.busy = true; busyKind = kind; S.thinking = true; btnTalk.classList.add('busy'); talkLabel.textContent = '考え中';
   S.override = { x: 0.55, y: -0.6, until: performance.now() + 20000 };
-  if (kind === 'user') caption(`「${text}」`, 'heard', 0);
+  if (kind === 'user') caption(`「${text}」 … 考え中`, 'heard', 0);
+  log(`${kind === 'user' ? '質問' : '合図'}: ${text.slice(0, 30)}`);
+  const ac = new AbortController();
   try {
-    const reply = await askClaude(kind === 'user' ? text : `(システム: ${text})`);
+    const reply = await askClaude(kind === 'user' ? text : `(システム: ${text})`, ac.signal);
     S.thinking = false; S.override = null;
     setExpr(reply.emotion, 9000);
     caption(reply.say, 'say', 12000);
     log(`${reply.emotion}: ${reply.say}`);
-    if (cfg.debug && reply.read !== reply.say) log(`読み: ${reply.read}`);
-    await speak(reply.say, reply.read, reply.emotion);
+    if (reply.read !== reply.say) log(`読み: ${reply.read}`);
+    const spoke = await speak(reply.say, reply.read, reply.emotion);
+    if (spoke === false) caption(`${reply.say}\n（音声を再生できませんでした。画面を一度タップしてから、もう一度試してください）`, 'say', 15000);
     S.lastTalkAt = performance.now();
     S.busy = false; btnTalk.classList.remove('busy'); talkLabel.textContent = '話す';
-    if (cfg.continuous && kind === 'user') startListening();
+    if (cfg.continuous && kind === 'user' && !pendingText) setTimeout(() => { if (!S.busy && !S.listening) startListening(); }, 300);
   } catch (e) {
-    S.thinking = false; S.override = null; setExpr('sad', 3000);
-    caption((e instanceof TypeError ? '通信できませんでした（オフライン？）' : e.message), 'err', 9000);
-    log('エラー: ' + e.message);
-  } finally { S.busy = false; btnTalk.classList.remove('busy'); if (!S.listening) talkLabel.textContent = '話す'; }
+    S.thinking = false; S.override = null;
+    if (e.message !== '中断しました') { setExpr('sad', 3000); caption(e.message, 'err', 9000); log('エラー: ' + e.message); }
+  } finally {
+    S.busy = false; busyKind = null; currentAbort = null; btnTalk.classList.remove('busy'); if (!S.listening) talkLabel.textContent = '話す';
+    if (pendingText) { const t = pendingText; pendingText = null; converse(t); }
+  }
 }
 function maybeGreet(now) {
-  if (!cfg.greet || !cfg.apiKey || S.busy || !$('#start').hidden) return;
-  if (now - S.lastTalkAt < GREET_IDLE_MS || now - S.lastGreetAt < GREET_COOLDOWN_MS) return;
+  if (!cfg.greet || !cfg.apiKey || S.busy || S.listening || !$('#start').hidden) return;
+  if (now - S.lastTalkAt < GREET_IDLE_MS || now - S.lastGreetAt < GREET_COOLDOWN_MS || now - S.startedAt < 8000) return;
   S.lastGreetAt = now;
   converse('相手と目が合いました。見えている様子に軽く触れつつ、短くひとこと話しかけてください。', 'event');
 }
@@ -895,7 +969,7 @@ $('#btnStart').addEventListener('click', async () => {
   keepAwake(); unlockAudio();
   try {
     await startCamera(); await initLandmarker();
-    $('#start').hidden = true; log('追従開始'); setExpr('excited', 1500);
+    $('#start').hidden = true; S.startedAt = performance.now(); log('追従開始'); setExpr('excited', 1500);
     if (!cfg.apiKey) caption('「設定」で Claude の APIキーを入れると話せます', 'heard', 8000);
   } catch (e) {
     console.error(e);
@@ -903,12 +977,12 @@ $('#btnStart').addEventListener('click', async () => {
     $('#btnStart').disabled = false;
   }
 });
-$('#btnTouchOnly').addEventListener('click', () => { $('#start').hidden = true; keepAwake(); unlockAudio(); S.touchUntil = performance.now() + 1500; setExpr('curious', 1500); });
+$('#btnTouchOnly').addEventListener('click', () => { $('#start').hidden = true; S.startedAt = performance.now(); keepAwake(); unlockAudio(); S.touchUntil = performance.now() + 1500; setExpr('curious', 1500); });
 
 /* ========= コントロール・設定 ========= */
-btnTalk.addEventListener('click', () => { unlockAudio(); if (S.listening) stopListening(); else if (!S.busy) startListening(); });
+btnTalk.addEventListener('click', () => { unlockAudio(); if (S.listening) stopListening(); else startListening(); });
 $('#btnKbd').addEventListener('click', () => { const r = $('#textRow'); r.hidden = !r.hidden; if (!r.hidden) $('#txt').focus(); });
-function sendText() { const t = $('#txt').value.trim(); if (!t) return; $('#txt').value = ''; converse(t); }
+function sendText() { const t = $('#txt').value.trim(); if (!t) return; $('#txt').value = ''; unlockAudio(); if (S.listening) stopListening(true); converse(t); }
 $('#btnSend').addEventListener('click', sendText);
 $('#txt').addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); sendText(); } });
 
@@ -937,8 +1011,33 @@ $('#btnTest').addEventListener('click', async () => {
   try {
     const t = await callClaude([{ role: 'user', content: '「接続OK」とだけ答えて' }], { maxTokens: 20, system: '短く答える' });
     out.textContent = `OK: ${cfg.model} → ${t.trim()}`; out.className = 'ok';
-  } catch (e) { out.textContent = e instanceof TypeError ? '通信できませんでした' : e.message; out.className = 'ng'; }
+  } catch (e) { out.textContent = e.message; out.className = 'ng'; }
 });
+$('#btnSpeakTest').addEventListener('click', async () => {
+  unlockAudio();
+  const ok = await speakBuiltin('音声テストです。聞こえていますか？', 'happy');
+  log(`音声テスト: ${ok ? '再生できた' : '再生できず'}`);
+  if (!ok) caption('音声を再生できませんでした。画面を一度タップしてから、もう一度押してください', 'err', 8000);
+  renderDiag();
+});
+$('#btnCopyLog').addEventListener('click', async e => {
+  const text = [diagText(), '', ...LOGS].join('\n');
+  try { await navigator.clipboard.writeText(text); e.currentTarget.textContent = 'コピーしました'; }
+  catch { const r = document.createRange(); r.selectNodeContents($('#fullLog')); const s = getSelection(); s.removeAllRanges(); s.addRange(r); e.currentTarget.textContent = '選択しました（長押しでコピー）'; }
+  setTimeout(() => { e.currentTarget.textContent = 'ログをコピー'; }, 2500);
+});
+$('#btnClearLog').addEventListener('click', () => { LOGS.length = 0; $('#fullLog').textContent = '（まだ何もありません）'; });
+function diagText() {
+  const ja = 'speechSynthesis' in window ? speechSynthesis.getVoices().filter(v => /^ja/i.test(v.lang)).length : 0;
+  return [
+    `画面: ${navigator.standalone ? 'ホーム画面アプリ' : 'ブラウザ'} / ${location.protocol} / ${navigator.userAgent.match(/OS (\d+_\d+)/)?.[1]?.replace('_', '.') || '?'}`,
+    `APIキー: ${cfg.apiKey ? '設定済み（' + cfg.apiKey.slice(0, 10) + '…）' : '未設定'} / モデル: ${cfg.model}`,
+    `音声認識: ${SR ? 'あり' : 'なし'} / 内蔵音声(日本語): ${ja}個 / エンジン: ${cfg.ttsEngine} / 工夫: ${cfg.smartRead ? 'on' : 'off'} / 続けて聞く: ${cfg.continuous ? 'on' : 'off'}`,
+    `状態: busy=${S.busy} listening=${S.listening} speaking=${S.speaking} 履歴=${history.length}件${S.lastSpeechError ? ' / 音声エラー: ' + S.lastSpeechError : ''}`,
+  ].join('\n');
+}
+function renderDiag() { $('#diag').textContent = diagText(); }
+$('#btnSettings').addEventListener('click', renderDiag);
 document.querySelectorAll('[data-cfg]').forEach(el => {
   const k = el.dataset.cfg, isBool = el.type === 'checkbox';
   if (isBool) el.checked = !!cfg[k]; else el.value = cfg[k];
